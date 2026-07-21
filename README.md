@@ -164,6 +164,8 @@ SONIC supports real-time whole-body teleoperation via PICO VR headset, enabling 
 
 <p align="center"><em><strong>SONIC Low Latency:</strong> 3-point VR teleoperation with whole-body tracking and a successful ground pickup.</em></p>
 
+> **This fork (marinmarian):** our rig-specific setup — network/IGMP querier, 5 GHz headset hotspot, Inspire RH56 hand integration, the Meta Quest 3 (CloudXR) and PICO 4 (XRoboToolkit) paths, the decoupled_wbc IK `quest` device, and full run sheets — is documented in [`CUSTOM_SETUP.md`](CUSTOM_SETUP.md).
+
 This repo can also drive the headset over Isaac Teleop / CloudXR by launching `gear_sonic/scripts/pico_manager_thread_server.py --input-source isaac-teleop`. The streamer hosts the CloudXR runtime in-process via `isaacteleop[cloudxr]` — no separate publisher container required. That path is currently documented and supported only for **G1 with a Thor backpack**. The Isaac Teleop bring-up steps are documented in [`docs/source/tutorials/isaac_teleop_publisher_setup.md`](docs/source/tutorials/isaac_teleop_publisher_setup.md).
 
 <div align="center">
