@@ -146,3 +146,26 @@ control loop.
 ### Safety
 Robot hoisted, area clear, e‑stop within reach. Killing the deploy with SIGKILL skips the
 graceful damping command — prefer `O` / Ctrl‑C, and `L2+B` on the remote to damp.
+
+---
+
+## 7. Head camera in the PICO (XRoboToolkit Remote Vision)
+
+The G1 head camera (Intel RealSense **D430i**, IR-only -- no RGB) can be shown as a 2D
+screen inside the PICO **during teleop** via XRoboToolkit's **Remote Vision** video path,
+which is a separate channel from the `--input-source xrt` tracking. We stream the left-IR
+node (`/dev/video2`, GRAY8 640x480) HW-encoded to H.264 from the robot's onboard PC (a
+Jetson Orin Nano). The installed `roboticsservice` PC-service is tracking-only and is
+**not** the camera path.
+
+Tooling lives in **`tools/headcam_pico/`**: `main_web_ir.cpp` (a drop-in for the
+third-party `XR-Robotics/XRoboToolkit-Orin-Video-Sender`, ported from its
+`main_zed_tcp.cpp` to capture the RealSense IR node instead of a ZED and to accept any
+camera type), `run_headcam_sender.sh` (launch helper), and a README with full
+build / run / protocol details.
+
+Run on the robot PC: `./run_headcam_sender.sh` (listens on `0.0.0.0:13579`); in the PICO
+set Remote Vision **camera source IP = <robot PC IP>**. The headset connects, sends
+`OPEN_CAMERA` with its callback ip:port, and the sender streams H.264 back. Runs alongside
+teleop. Known rough edge: the mono IR is upscaled to the headset's stereo canvas so it
+looks stretched -- letterbox or a proper side-by-side split is a TODO.
