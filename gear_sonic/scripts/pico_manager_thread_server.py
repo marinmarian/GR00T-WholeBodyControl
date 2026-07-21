@@ -965,6 +965,9 @@ class ThreePointPose:
         enable_smpl_vis: bool = False,
         log_prefix: str = "ThreePointPose",
         robot_model=None,
+        pos_scale: float = 1.0,
+        pos_clamp_radius: float = 0.0,
+        smooth_alpha: float = 0.0,
     ):
         """
         Initialize 3-point pose processor.
@@ -979,6 +982,13 @@ class ThreePointPose:
                         Used for FK-based calibration (no display required).
         """
         self.log_prefix = log_prefix
+        # VR_3PT target conditioning: workspace scale about the FK calibration
+        # anchor, reachability clamp (m, 0=off), and EMA smoothing (0=off, else
+        # per-frame alpha; ema = a*new + (1-a)*prev).
+        self.pos_scale = float(pos_scale)
+        self.pos_clamp_radius = float(pos_clamp_radius)
+        self.smooth_alpha = float(smooth_alpha)
+        self._ema_pose: np.ndarray | None = None
         self.with_g1_robot = with_g1_robot
         self.enable_waist_tracking = enable_waist_tracking
         self.enable_smpl_vis = enable_smpl_vis
@@ -1022,6 +1032,8 @@ class ThreePointPose:
         self._calibration_rwrist_offset: np.ndarray | None = None
         self._calibration_lwrist_rot_offset: sRot | None = None  # orientation offset
         self._calibration_rwrist_rot_offset: sRot | None = None
+        self._calibration_lwrist_fk_ref: np.ndarray | None = None  # FK anchor at calibration
+        self._calibration_rwrist_fk_ref: np.ndarray | None = None
         # Override robot q for FK during recalibration (e.g. measured joints for VR 3PT)
         self._override_robot_q: np.ndarray | None = None
 
@@ -1062,6 +1074,7 @@ class ThreePointPose:
 
         # Apply calibration to get the final pose
         vr_3pt_pose = self._apply_calibration(vr_3pt_pose_raw)
+        vr_3pt_pose = self._smooth_pose(vr_3pt_pose)
 
         if self.vr3pt_visualizer is not None:
             self.vr3pt_visualizer.update_from_vr_pose(vr_3pt_pose, waist_scale=1.0)
@@ -1103,7 +1116,7 @@ class ThreePointPose:
         # Step 1: Neck orientation — only capture if not already set
         if self._calibration_neck_quat_inv is None:
             neck_quat_wxyz = vr_3pt_pose[2, 3:].copy()
-            neck_rot = sRot.from_quat(neck_quat_wxyz, scalar_first=True)
+            neck_rot = self._yaw_only(sRot.from_quat(neck_quat_wxyz, scalar_first=True))
             self._calibration_neck_quat_inv = neck_rot.inv().as_quat(scalar_first=True)
         calib_inv_rot = sRot.from_quat(self._calibration_neck_quat_inv, scalar_first=True)
 
@@ -1146,6 +1159,10 @@ class ThreePointPose:
         # Compute position offsets: calibrated = neck_corrected - offset
         self._calibration_lwrist_offset = lwrist_pos_corrected - g1_lwrist_pos
         self._calibration_rwrist_offset = rwrist_pos_corrected - g1_rwrist_pos
+        # FK anchors for workspace scaling/clamping (robot wrist pose at calibration)
+        self._calibration_lwrist_fk_ref = np.asarray(g1_lwrist_pos, dtype=np.float64).copy()
+        self._calibration_rwrist_fk_ref = np.asarray(g1_rwrist_pos, dtype=np.float64).copy()
+        self._ema_pose = None  # restart smoothing after any recalibration
 
         # Compute orientation offsets: calibrated = rot_offset * neck_corrected
         self._calibration_lwrist_rot_offset = g1_lwrist_rot * lwrist_rot_corrected.inv()
@@ -1172,18 +1189,21 @@ class ThreePointPose:
         calibrated = vr_3pt_pose.copy()
         calib_inv_rot = sRot.from_quat(self._calibration_neck_quat_inv, scalar_first=True)
 
-        # Neck orientation: calibrated = inv(initial) * current
-        neck_rot = sRot.from_quat(vr_3pt_pose[2, 3:], scalar_first=True)
+        # Neck orientation: calibrated = inv(initial_yaw) * current_yaw
+        # (yaw-only on both sides: synthesized neck roll/pitch is untrustworthy)
+        neck_rot = self._yaw_only(sRot.from_quat(vr_3pt_pose[2, 3:], scalar_first=True))
         calibrated[2, 3:] = (calib_inv_rot * neck_rot).as_quat(scalar_first=True)
 
         # Wrist positions: rotate by neck inverse, then subtract offset
         if self._calibration_lwrist_offset is not None:
-            calibrated[0, :3] = (
-                calib_inv_rot.apply(vr_3pt_pose[0, :3]) - self._calibration_lwrist_offset
+            calibrated[0, :3] = self._condition_wrist_target(
+                calib_inv_rot.apply(vr_3pt_pose[0, :3]) - self._calibration_lwrist_offset,
+                self._calibration_lwrist_fk_ref,
             )
         if self._calibration_rwrist_offset is not None:
-            calibrated[1, :3] = (
-                calib_inv_rot.apply(vr_3pt_pose[1, :3]) - self._calibration_rwrist_offset
+            calibrated[1, :3] = self._condition_wrist_target(
+                calib_inv_rot.apply(vr_3pt_pose[1, :3]) - self._calibration_rwrist_offset,
+                self._calibration_rwrist_fk_ref,
             )
 
         # Wrist orientations: rot_offset * (neck_inv * current)
@@ -1206,6 +1226,52 @@ class ThreePointPose:
 
         return calibrated
 
+    @staticmethod
+    def _yaw_only(rot: sRot) -> sRot:
+        """Project a rotation to its heading (yaw about Z). The Quest-synthesized
+        neck joint carries bogus roll/pitch; only its yaw is trustworthy. A wrong
+        neck frame cancels out for wrist ORIENTATIONS (sandwiched by calibration)
+        but rotates every wrist POSITION delta — killing translation tracking."""
+        fwd = rot.apply([1.0, 0.0, 0.0])
+        yaw = float(np.arctan2(fwd[1], fwd[0]))
+        return sRot.from_euler("z", yaw)
+
+    def _condition_wrist_target(self, pos: np.ndarray, fk_ref: np.ndarray | None) -> np.ndarray:
+        """Scale the wrist target about the FK calibration anchor and clamp its
+        excursion so human reach maps inside the G1 workspace."""
+        if fk_ref is None:
+            return pos
+        d = pos - fk_ref
+        if self.pos_scale != 1.0:
+            d = d * self.pos_scale
+        if self.pos_clamp_radius > 0.0:
+            norm = float(np.linalg.norm(d))
+            if norm > self.pos_clamp_radius:
+                d = d * (self.pos_clamp_radius / norm)
+        return fk_ref + d
+
+    def _smooth_pose(self, pose: np.ndarray) -> np.ndarray:
+        """EMA on positions + sign-corrected nlerp on quaternions (rows: L, R, neck)."""
+        a = self.smooth_alpha
+        if a <= 0.0 or a >= 1.0:
+            return pose
+        if self._ema_pose is None:
+            self._ema_pose = pose.copy()
+            return pose
+        prev = self._ema_pose
+        out = pose.copy()
+        out[:, :3] = a * pose[:, :3] + (1.0 - a) * prev[:, :3]
+        for i in range(pose.shape[0]):
+            q_new = pose[i, 3:]
+            q_prev = prev[i, 3:]
+            if float(np.dot(q_new, q_prev)) < 0.0:
+                q_new = -q_new
+            q = a * q_new + (1.0 - a) * q_prev
+            norm = float(np.linalg.norm(q))
+            out[i, 3:] = q / norm if norm > 1e-9 else q_prev
+        self._ema_pose = out.copy()
+        return out
+
     def _clear_calibration(self):
         """Clear all calibration state."""
         self._calibration_neck_quat_inv = None
@@ -1213,6 +1279,9 @@ class ThreePointPose:
         self._calibration_rwrist_offset = None
         self._calibration_lwrist_rot_offset = None
         self._calibration_rwrist_rot_offset = None
+        self._calibration_lwrist_fk_ref = None
+        self._calibration_rwrist_fk_ref = None
+        self._ema_pose = None
         self._override_robot_q = None
 
     def reset(self) -> None:
@@ -1568,10 +1637,11 @@ class PoseStreamer:
 def _init_input_source(
     input_source: str,
     buffer_size: int,
+    use_adb: bool = False,
 ) -> "PicoReader | input_readers.IsaacTeleopReader":
     """Create, start, and wait for readiness of the requested teleop input source."""
     if input_source == "isaac-teleop":
-        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size)
+        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size, use_adb=use_adb)
         reader.start()
         print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
         while reader.get_latest() is None:
@@ -1912,6 +1982,13 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    inspire_hands: str = "off",
+    inspire_left_ip: str = None,
+    inspire_right_ip: str = None,
+    use_adb: bool = False,
+    vr3pt_scale: float = 1.0,
+    vr3pt_clamp: float = 0.0,
+    vr3pt_smooth: float = 0.0,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1919,7 +1996,23 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
-    reader = _init_input_source(input_source, buffer_size)
+    reader = _init_input_source(input_source, buffer_size, use_adb=use_adb)
+
+    # Optional Inspire RH56 hand bridge: maps controller trigger/squeeze to
+    # finger angles over Modbus TCP, independent of the (Dex3-only) C++ deploy.
+    inspire_bridge = None
+    if inspire_hands != "off":
+        from gear_sonic.utils.teleop.inspire.inspire_bridge import InspireBridge
+
+        bridge_kwargs = {"mode": inspire_hands}
+        if inspire_left_ip:
+            bridge_kwargs["left_ip"] = inspire_left_ip
+        if inspire_right_ip:
+            bridge_kwargs["right_ip"] = inspire_right_ip
+        inspire_bridge = InspireBridge(
+            get_inputs=lambda: get_controller_inputs(reader), **bridge_kwargs
+        )
+        inspire_bridge.start()
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1941,6 +2034,9 @@ def run_pico_manager(
         enable_waist_tracking=enable_waist_tracking,
         enable_smpl_vis=enable_smpl_vis,
         log_prefix="PoseLoop",
+        pos_scale=vr3pt_scale,
+        pos_clamp_radius=vr3pt_clamp,
+        smooth_alpha=vr3pt_smooth,
     )
 
     pose_streamer = PoseStreamer(
@@ -1958,7 +2054,7 @@ def run_pico_manager(
         socket=socket,
         reader=reader,
         three_point=three_point,
-        poll_hz=20,
+        poll_hz=50,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
@@ -1997,6 +2093,11 @@ def run_pico_manager(
             left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
 
             left_axis_click, _ = get_axis_clicks(reader)
+            # Quest WebXR client never forwards thumbstick clicks (verified) —
+            # accept B+X (with A and Y released) as the VR_3PT toggle instead.
+            left_axis_click = left_axis_click or (
+                b_pressed and x_pressed and not a_pressed and not y_pressed
+            )
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -2006,6 +2107,14 @@ def run_pico_manager(
 
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+            # Debounce: ignore combo re-trigger within 3 s (chunky VR input can
+            # double-fire the edge detector, instantly stopping the policy).
+            _now_combo = time.monotonic()
+            if start_combo and not prev_start_combo:
+                if _now_combo - globals().get("_last_combo_t", 0.0) < 3.0:
+                    start_combo = False
+                else:
+                    globals()["_last_combo_t"] = _now_combo
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -2150,6 +2259,8 @@ def run_pico_manager(
         print("\nStopping manager...")
     finally:
         # Cleanup resources
+        if inspire_bridge is not None:
+            inspire_bridge.stop()
         reader.stop()
         three_point.close()
         socket.close()
@@ -2251,6 +2362,61 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--inspire-hands",
+        type=str,
+        default="off",
+        choices=["off", "trigger", "handtracking"],
+        help=(
+            "Drive Inspire RH56 hands over Modbus TCP (manager mode only): "
+            "'trigger' maps controller trigger/squeeze to finger curl, "
+            "'handtracking' is reserved for per-finger headset tracking (not "
+            "implemented yet). Default: off (no hand I/O, PICO behavior unchanged)."
+        ),
+    )
+    parser.add_argument(
+        "--inspire-left-ip",
+        type=str,
+        default=None,
+        help="Left Inspire hand IP (default 192.168.123.210)",
+    )
+    parser.add_argument(
+        "--vr3pt-scale",
+        type=float,
+        default=0.8,
+        help="Scale factor mapping human wrist excursion onto the G1 workspace "
+             "(about the calibration anchor). 1.0 = raw metric 1:1. Default 0.8.",
+    )
+    parser.add_argument(
+        "--vr3pt-clamp",
+        type=float,
+        default=0.45,
+        help="Max wrist-target excursion (m) from the calibration anchor; targets "
+             "beyond this are clamped to the sphere. 0 disables. Default 0.45.",
+    )
+    parser.add_argument(
+        "--vr3pt-smooth",
+        type=float,
+        default=0.3,
+        help="EMA alpha for VR_3PT targets (positions + nlerp on quats), applied "
+             "per streamed frame. 0 disables, lower = smoother. Default 0.3.",
+    )
+    parser.add_argument(
+        "--use-adb",
+        action="store_true",
+        help=(
+            "USB-local mode: route CloudXR signaling + WebRTC media over the USB "
+            "cable via adb reverse + a local coturn (isaac-teleop input only). "
+            "Requires adb & coturn installed and USB debugging authorized on the "
+            "headset; headset WiFi must stay associated (no traffic flows on it)."
+        ),
+    )
+    parser.add_argument(
+        "--inspire-right-ip",
+        type=str,
+        default=None,
+        help="Right Inspire hand IP (default 192.168.123.211)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2292,6 +2458,13 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            inspire_hands=args.inspire_hands,
+            inspire_left_ip=args.inspire_left_ip,
+            inspire_right_ip=args.inspire_right_ip,
+            use_adb=args.use_adb,
+            vr3pt_scale=args.vr3pt_scale,
+            vr3pt_clamp=args.vr3pt_clamp,
+            vr3pt_smooth=args.vr3pt_smooth,
         )
     else:
         # Run legacy single-thread pose streaming

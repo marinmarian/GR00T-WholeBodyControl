@@ -299,6 +299,13 @@ def _controller_inputs_to_dict_side(snapshot: Any) -> dict[str, Any] | None:
     inputs = _attr_or_item(snapshot, "inputs")
     if inputs is None:
         return None
+    if not getattr(_controller_inputs_to_dict_side, "_dumped", False):
+        _controller_inputs_to_dict_side._dumped = True
+        try:
+            fields = [a for a in dir(inputs) if not a.startswith("_")]
+            print(f"[DEBUG] ControllerSnapshot.inputs fields: {fields}", flush=True)
+        except Exception:
+            pass
     return {
         "trigger_value": float(_attr_or_item(inputs, "trigger_value", 0.0) or 0.0),
         "squeeze_value": float(_attr_or_item(inputs, "squeeze_value", 0.0) or 0.0),
@@ -323,6 +330,10 @@ def _build_controller_dict(raw: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
 
     out: dict[str, Any] = {}
+    _clicks = (left or {}).get("thumbstick_click", 0.0), (right or {}).get("thumbstick_click", 0.0), (left or {}).get("menu_click", 0.0) if left else 0.0
+    if _clicks != getattr(_build_controller_dict, "_prev_clicks", None):
+        _build_controller_dict._prev_clicks = _clicks
+        print(f"[DEBUG] clicks changed: L-stick={_clicks[0]} R-stick={_clicks[1]}", flush=True)
     if left is not None:
         out["left_trigger_value"] = left["trigger_value"]
         out["left_squeeze_value"] = left["squeeze_value"]
@@ -448,6 +459,20 @@ class IsaacTeleopReader:
                     self._latest_controller = controller
 
             body_poses = _body_data_to_24x7(raw.get("full_body"))
+            # DEBUG: compare synthesized body wrists vs true controller poses (2 s cadence)
+            _now_cmp = time.monotonic()
+            if body_poses is not None and _now_cmp - getattr(self, "_cmp_t", 0.0) > 2.0:
+                self._cmp_t = _now_cmp
+                try:
+                    lc = raw.get("left_controller"); rc = raw.get("right_controller"); hd = raw.get("head")
+                    def _p(x):
+                        pose = _attr_or_item(x, "pose")
+                        pos = _attr_or_item(pose, "position") if pose is not None else None
+                        if pos is None: return "n/a"
+                        return f"({_attr_or_item(pos,'x',0):+.3f},{_attr_or_item(pos,'y',0):+.3f},{_attr_or_item(pos,'z',0):+.3f})"
+                    print(f"[CMP] ctrlL={_p(lc)} ctrlR={_p(rc)} head={_p(hd)} | bodyL22=({body_poses[22,0]:+.3f},{body_poses[22,1]:+.3f},{body_poses[22,2]:+.3f}) bodyR23=({body_poses[23,0]:+.3f},{body_poses[23,1]:+.3f},{body_poses[23,2]:+.3f}) neck12=({body_poses[12,0]:+.3f},{body_poses[12,1]:+.3f},{body_poses[12,2]:+.3f}) root0=({body_poses[0,0]:+.3f},{body_poses[0,1]:+.3f},{body_poses[0,2]:+.3f})", flush=True)
+                except Exception as e:
+                    print(f"[CMP] debug failed: {e}", flush=True)
             if body_poses is None:
                 if not self._unrecognised_logged and not _attr_or_item(
                     raw.get("full_body"), "joint_positions"

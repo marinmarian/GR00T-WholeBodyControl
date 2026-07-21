@@ -32,7 +32,10 @@ class TeleopStreamer:
         # enable real robot and devices
         self.enable_real_device = enable_real_device
         if self.enable_real_device:
-            if body_control_device == "vive":
+            if body_control_device in ("vive", "quest"):
+                # 'quest': Quest 3 via our quest_vive_bridge, which emits pico-style
+                # headset-relative poses over the vive ZMQ protocol. Same transport as
+                # vive; calibration uses the pico (identity) branch (see wrists.py).
                 from decoupled_wbc.control.teleop.streamers.vive_streamer import ViveStreamer
 
                 self.body_streamer = ViveStreamer(

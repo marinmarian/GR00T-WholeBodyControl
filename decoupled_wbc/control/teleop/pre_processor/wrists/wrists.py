@@ -69,8 +69,9 @@ class WristsPreProcessor(PreProcessor):
             # local frame with hardcoded rotations since we don't have a common
             # reference frame for teleop and robot.
             self.init_teleop_T_init_ee[ee_name] = np.eye(4)
-            if control_device == "pico":
-                # TODO: add pico wrist calibration respect to the headset frame
+            if control_device in ("pico", "quest"):
+                # pico/quest poses are already headset-relative (identity alignment);
+                # no vive-tracker rotation correction (which is also asymmetric L/R).
                 pass
             else:
                 if ee_name == self.robot.supplemental_info.hand_frame_names["left"]:
