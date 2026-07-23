@@ -169,3 +169,40 @@ set Remote Vision **camera source IP = <robot PC IP>**. The headset connects, se
 `OPEN_CAMERA` with its callback ip:port, and the sender streams H.264 back. Runs alongside
 teleop. Known rough edge: the mono IR is upscaled to the headset's stereo canvas so it
 looks stretched -- letterbox or a proper side-by-side split is a TODO.
+
+---
+
+## 8. Single-arm teleop (`--tracked_hands`) + one-command runner
+
+The left arm on our G1 is hardware-disabled (failed temperature sensor on the left
+shoulder-yaw motor; Unitree firmware disables the whole limb). For right-arm-only teleop
+the decoupled_wbc pipeline gained a shared config flag **`--tracked_hands {both,left,right}`**
+(default `both` = unchanged behavior):
+
+- **teleop loop** — the untracked wrist's IK FrameTask gets zero position/orientation cost
+  (`body_ik_solver.py`), so that arm settles to the posture-nominal instead of chasing a
+  controller.
+- **control loop** — `JointSafetyMonitor` stops monitoring the untracked arm
+  (`joint_safety.py` `disabled_arms`), so the limp limb's passive motion can't trigger the
+  critical velocity shutdown.
+
+Pass the flag to BOTH `run_g1_control_loop.py` and `run_teleop_policy_loop.py`.
+
+**PICO body input** for this pipeline runs through **`pico_vive_bridge.py`** (repo root, host
+`.venv_teleop`): the wbc container has no `xrobotoolkit_sdk`/roboticsservice, so the bridge
+reads the PICO SDK on the host and serves poses over the vive-ZMQ protocol (port 5555) —
+the container teleop loop consumes it with `--body_control_device quest
+--body_streamer_ip 127.0.0.1 --body_streamer_keyword wrist`. `--inspire-hands trigger`
+also drives the Inspire hand(s) of the tracked side (right trigger -> fingers, grip -> thumb).
+
+**One-command runner: `tools/g1-teleop.sh`** (deploy to `~/g1-teleop.sh` on the host).
+`up` starts everything in a tmux session `g1` with ordering waits built in (xr-service ->
+bridge; control loop -> teleop loop), `down` stops it, `status` health-checks. Windows:
+`svc` = xr-service / head-cam / bridge, `run` = control + teleop loops (activation keys
+`]` `l` `o` go in the left pane). The IGMP querier stays manual (`sudo python3
+~/igmp_querier.py`, foreground) and the PICO app steps stay manual (PC service = mjolnir IP,
+Remote Vision = robot-PC IP).
+
+Known trip: a fast right-arm motion (or the engage snap) can exceed the 8 rad/s arm
+velocity limit -> safe mode latches -> `docker restart wbc-dev`, rerun. Move gently for the
+first seconds after `l`.

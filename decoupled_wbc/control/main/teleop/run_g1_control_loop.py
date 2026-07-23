@@ -57,11 +57,13 @@ def main(config: ControlLoopConfig):
         waist_location=waist_location, high_elbow_pose=config.high_elbow_pose
     )
 
+    disabled_arms = {"both": [], "left": ["right"], "right": ["left"]}[config.tracked_hands]
     env = G1Env(
         env_name=config.env_name,
         robot_model=robot_model,
         config=wbc_config,
         wbc_version=config.wbc_version,
+        disabled_arms=disabled_arms,
     )
     if env.sim and not config.sim_sync_mode:
         env.start_simulator()

@@ -62,6 +62,7 @@ class BodyIKSolver(Solver):
         self.posture_weight = ik_solver_settings.posture_weight
         self.posture_cost = ik_solver_settings.posture_cost
         self.posture_lm_damping = ik_solver_settings.posture_lm_damping
+        self.tracked_hands = getattr(ik_solver_settings, "tracked_hands", ["left", "right"])
         self.robot = None
 
     def register_robot(self, robot):
@@ -97,9 +98,14 @@ class BodyIKSolver(Solver):
                 # Use hand_frame_names from supplemental info
                 for side in ["left", "right"]:
                     frame_name = self.robot.supplemental_info.hand_frame_names[side]
+                    side_weight = dict(weight)
+                    if side not in self.tracked_hands:
+                        side_weight["position_cost"] = 0.0
+                        side_weight["orientation_cost"] = 0.0
+                        print("[BodyIKSolver] wrist side " + side + " NOT tracked (cost=0)")
                     task = FrameTask(
                         frame_name,
-                        **weight,
+                        **side_weight,
                     )
                     self.tasks[frame_name] = task
             else:

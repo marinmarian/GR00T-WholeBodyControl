@@ -21,7 +21,8 @@ class JointSafetyMonitor:
     ARM_VELOCITY_LIMIT = 8.0  # rad/s for arm joints (bumped from 6.0: activation transient)
     HAND_VELOCITY_LIMIT = 50.0  # rad/s for finger joints
 
-    def __init__(self, robot_model, enable_viz: bool = False, env_type: str = "real"):
+    def __init__(self, robot_model, enable_viz: bool = False, env_type: str = "real",
+                 disabled_arms: Optional[List[str]] = None):
         """Initialize joint safety monitor.
 
         Args:
@@ -33,6 +34,9 @@ class JointSafetyMonitor:
         self.safety_margin = 1.0  # Hardcoded safety margin
         self.enable_viz = enable_viz
         self.env_type = env_type
+        self.disabled_arms = disabled_arms or []
+        if self.disabled_arms:
+            print("[JointSafetyMonitor] NOT monitoring disabled arm(s): " + str(self.disabled_arms))
 
         # Startup ramping parameters
         self.control_frequency = 50  # Hz, hardcoded from run_g1_control_loop.py
@@ -149,6 +153,10 @@ class JointSafetyMonitor:
             arm_joint_names = [self.robot_model.joint_names[i] for i in arm_indices]
 
             for joint_name in arm_joint_names:
+                # Skip arms disabled in hardware (e.g. a faulted limp limb) so their
+                # passive motion cannot trip the critical velocity shutdown.
+                if any(joint_name.startswith(side + "_") for side in self.disabled_arms):
+                    continue
                 # Set velocity limits
                 vel_limit = self.ARM_VELOCITY_LIMIT * self.safety_margin
                 self.velocity_limits[joint_name] = {"min": -vel_limit, "max": vel_limit}

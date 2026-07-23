@@ -37,12 +37,14 @@ def main(config: TeleopConfig):
         )
     else:
         print("running teleop policy, waiting teleop policy to be initialized...")
+        tracked_hands_map = {"both": ["left", "right"], "left": ["left"], "right": ["right"]}
         retargeting_ik = TeleopRetargetingIK(
             robot_model=robot_model,
             left_hand_ik_solver=left_hand_ik_solver,
             right_hand_ik_solver=right_hand_ik_solver,
             enable_visualization=config.enable_visualization,
             body_active_joint_groups=["upper_body"],
+            tracked_hands=tracked_hands_map[config.tracked_hands],
         )
         teleop_policy = TeleopPolicy(
             robot_model=robot_model,

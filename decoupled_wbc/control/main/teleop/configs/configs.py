@@ -187,6 +187,10 @@ class BaseConfig(ArgsConfigTemplate):
     upper_body_operation_mode: Literal["teleop", "inference"] = "teleop"
     """Upper body operation mode"""
 
+    tracked_hands: Literal["both", "left", "right"] = "both"
+    """Which arm(s) the body IK tracks and the safety monitor watches. Use 'right' for
+    right-arm-only teleop when the left arm is hardware-disabled (and vice versa)."""
+
     def __post_init__(self):
         # Resolve interface (handles sim/real shortcuts, platform differences, and error handling)
         self.interface, self.env_type = resolve_interface(self.interface)

@@ -22,6 +22,7 @@ class G1Env(HumanoidEnv):
         robot_model: RobotModel = None,
         wbc_version: str = "v2",
         config: Dict[str, any] = None,
+        disabled_arms=None,
         **kwargs,
     ):
         super().__init__()
@@ -30,7 +31,8 @@ class G1Env(HumanoidEnv):
 
         # Initialize safety monitor (visualization disabled)
         self.safety_monitor = JointSafetyMonitor(
-            robot_model, enable_viz=False, env_type=self.config.get("ENV_TYPE", "real")
+            robot_model, enable_viz=False, env_type=self.config.get("ENV_TYPE", "real"),
+            disabled_arms=disabled_arms,
         )
         self.last_obs = None
         self.last_safety_ok = True  # Track last safety status from queue_action

@@ -25,6 +25,7 @@ class TeleopRetargetingIK(Policy):
         enable_visualization=False,
         body_active_joint_groups: Optional[List[str]] = None,
         body_ik_solver_settings_type: str = "default",
+        tracked_hands: Optional[List[str]] = None,
     ):
         # initialize the body
         if body_active_joint_groups is not None:
@@ -41,6 +42,8 @@ class TeleopRetargetingIK(Policy):
             raise ValueError(
                 f"Unknown body_ik_solver_settings_type: {body_ik_solver_settings_type}"
             )
+        if tracked_hands is not None:
+            body_ik_solver_settings.tracked_hands = tracked_hands
         self.body_ik_solver = BodyIKSolver(body_ik_solver_settings)
 
         # We register the specific robot model to the robot-agnostic body IK solver class

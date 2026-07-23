@@ -4,6 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class BodyIKSolverSettings:
     def __init__(self):
+        self.tracked_hands = ["left", "right"]
         self.dt = 0.05
         self.num_step_per_frame = 3
         self.amplify_factor = 1.0
