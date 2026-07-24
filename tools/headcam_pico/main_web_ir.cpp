@@ -20,6 +20,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
 #include <thread>
 #include <vector>
 
@@ -186,6 +187,8 @@ std::string g_pixfmt = "GRAY8";  // GStreamer caps format: GRAY8, YUY2, UYVY, ..
 int g_cap_width = 640;
 int g_cap_height = 480;
 int g_cap_fps = 30;
+int g_flip = 0;   // rotation: 0=none 1=90ccw 2=180 3=90cw (CPU videoflip)
+bool g_letterbox = true;  // preserve aspect on the requested canvas (--fit stretch to disable)
 
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_helper(Args &&...args) {
@@ -447,12 +450,35 @@ void streamingThreadFunction() {
     int outH = config.height > 0 ? config.height : g_cap_height;
     int bitrate = config.bitrate > 0 ? config.bitrate : 4000000;
 
+    // Effective source dims after rotation (90-degree flips swap W/H)
+    int effW = (g_flip == 1 || g_flip == 3) ? g_cap_height : g_cap_width;
+    int effH = (g_flip == 1 || g_flip == 3) ? g_cap_width : g_cap_height;
+    static const char *kFlip[] = {"", "counterclockwise", "rotate-180", "clockwise"};
+
+    std::string mid;
+    if (g_flip >= 1 && g_flip <= 3)
+      mid += std::string("videoflip method=") + kFlip[g_flip] + " ! ";
+    if (g_letterbox && (outW * effH != outH * effW)) {
+      // Scale to fit inside outW x outH, pad the rest with black bars.
+      double sc = std::min((double)outW / effW, (double)outH / effH);
+      int sw = ((int)(effW * sc) / 2) * 2, sh = ((int)(effH * sc) / 2) * 2;
+      int padL = (outW - sw) / 2, padR = outW - sw - padL;
+      int padT = (outH - sh) / 2, padB = outH - sh - padT;
+      mid += "videoscale ! video/x-raw,width=" + std::to_string(sw) +
+             ",height=" + std::to_string(sh) + " ! "
+             "videobox fill=black left=-" + std::to_string(padL) +
+             " right=-" + std::to_string(padR) +
+             " top=-" + std::to_string(padT) +
+             " bottom=-" + std::to_string(padB) + " ! ";
+    }
+
     std::string pipeline_str =
         "v4l2src device=" + g_device + " ! "
         "video/x-raw,format=" + g_pixfmt +
         ",width=" + std::to_string(g_cap_width) +
         ",height=" + std::to_string(g_cap_height) +
         ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
+        "videoconvert ! video/x-raw,format=I420 ! " + mid +
         "videoconvert ! video/x-raw,format=NV12 ! "
         "nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width=" +
         std::to_string(outW) + ",height=" + std::to_string(outH) +
@@ -520,6 +546,10 @@ int main(int argc, char *argv[]) {
       g_cap_height = std::stoi(argv[++i]);
     } else if (arg == "--fps" && i + 1 < argc) {
       g_cap_fps = std::stoi(argv[++i]);
+    } else if (arg == "--flip" && i + 1 < argc) {
+      g_flip = std::stoi(argv[++i]);
+    } else if (arg == "--fit" && i + 1 < argc) {
+      g_letterbox = std::string(argv[++i]) != "stretch";
     } else if (arg == "--help") {
       std::cout << "Usage: " << argv[0] << " --listen IP:PORT [options]\n"
                 << "  Serves a V4L2 camera to XRoboToolkit Remote Vision.\n"
@@ -530,6 +560,7 @@ int main(int argc, char *argv[]) {
                 << "  --device /dev/video2   V4L2 node\n"
                 << "  --pixfmt GRAY8         GStreamer format (GRAY8, YUY2, UYVY)\n"
                 << "  --width 640 --height 480 --fps 30\n"
+                << "  --flip 0               nvvidconv flip-method (1=90ccw, 2=180, 3=90cw)\n"
                 << "Examples:\n"
                 << "  " << argv[0] << " --listen 0.0.0.0:13579\n"
                 << "  " << argv[0] << " --listen 0.0.0.0:13580 --device /dev/video0"
