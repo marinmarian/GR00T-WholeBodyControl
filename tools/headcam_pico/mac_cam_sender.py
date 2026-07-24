@@ -122,14 +122,19 @@ class Session:
         cw, ch, cfps = self.capture
         out_w = self.cfg["w"] or cw
         out_h = self.cfg["h"] or ch
-        br = self.cfg["bitrate"] or 4_000_000
+        # Cap bitrate: the headset asks for ~20 Mbps (sized for 60 fps); at our
+        # capture fps that would make enormous per-frame packets.
+        br = min(self.cfg["bitrate"] or 4_000_000, 6_000_000)
         return [
             FFMPEG, "-hide_banner", "-loglevel", "warning",
             "-f", "avfoundation", "-framerate", str(cfps),
             "-video_size", f"{cw}x{ch}", "-pixel_format", "uyvy422",
             "-i", self.device,
             "-vf", f"scale={out_w}:{out_h}",
+            # baseline + no B-frames: match the working NVENC sender (profile 66);
+            # VideoToolbox's default frame reordering stalls the headset decoder.
             "-c:v", "h264_videotoolbox", "-realtime", "true",
+            "-profile:v", "baseline", "-bf", "0",
             "-b:v", str(br), "-g", "15",
             "-bsf:v", "h264_metadata=aud=insert",
             "-f", "h264", "-",
@@ -219,11 +224,16 @@ def main():
     print(f"[sender] Remote Vision protocol on {args.listen} "
           f"(PICO: camera source IP = this Mac)", flush=True)
 
-    session = None
-    while True:
-        conn, addr = srv.accept()
-        print(f"[sender] control connection from {addr[0]}", flush=True)
+    state = {"session": None}
+    lock = threading.Lock()
+
+    def handle_control(conn, peer):
+        """One control client. Concurrent clients allowed (a stale/silent
+        connection must never block the accept loop); last OPEN_CAMERA wins."""
+        print(f"[sender] control connection from {peer}", flush=True)
+        conn.settimeout(300)  # reap silent dead clients
         buf = b""
+        opened_here = False
         try:
             while True:
                 d = conn.recv(4096)
@@ -235,24 +245,32 @@ def main():
                     if msg is None:
                         break
                     cmd, data = msg
-                    print(f"[sender] command: {cmd}", flush=True)
-                    if cmd == "OPEN_CAMERA":
-                        cfg = parse_open_camera(data)
-                        print(f"[sender] {cfg}", flush=True)
-                        if session:
-                            session.close()
-                        session = Session(device, capture, cfg)
-                    elif cmd == "CLOSE_CAMERA" and session:
-                        session.close()
-                        session = None
+                    print(f"[sender] command: {cmd} (from {peer})", flush=True)
+                    with lock:
+                        if cmd == "OPEN_CAMERA":
+                            cfg = parse_open_camera(data)
+                            print(f"[sender] {cfg}", flush=True)
+                            if state["session"]:
+                                state["session"].close()
+                            state["session"] = Session(device, capture, cfg)
+                            opened_here = True
+                        elif cmd == "CLOSE_CAMERA" and state["session"]:
+                            state["session"].close()
+                            state["session"] = None
+                            opened_here = False
         except OSError:
             pass
         finally:
             conn.close()
-            if session:
-                session.close()
-                session = None
-            print("[sender] control disconnected, waiting for new connection", flush=True)
+            with lock:
+                if opened_here and state["session"]:
+                    state["session"].close()
+                    state["session"] = None
+            print(f"[sender] control from {peer} disconnected", flush=True)
+
+    while True:
+        conn, addr = srv.accept()
+        threading.Thread(target=handle_control, args=(conn, addr[0]), daemon=True).start()
 
 
 if __name__ == "__main__":

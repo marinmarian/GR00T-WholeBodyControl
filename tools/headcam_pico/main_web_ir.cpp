@@ -180,6 +180,13 @@ std::unique_ptr<TCPServer> server_ptr;
 std::string send_to_server = "";
 int send_to_port = 0;
 
+// Capture configuration (CLI-overridable; defaults = D430i left-IR head cam)
+std::string g_device = "/dev/video2";
+std::string g_pixfmt = "GRAY8";  // GStreamer caps format: GRAY8, YUY2, UYVY, ...
+int g_cap_width = 640;
+int g_cap_height = 480;
+int g_cap_fps = 30;
+
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_helper(Args &&...args) {
   return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
@@ -434,15 +441,18 @@ void streamingThreadFunction() {
       std::lock_guard<std::mutex> lock(config_mutex);
       config = current_camera_config;
     }
-    // Scale the 640x480 IR feed to whatever resolution the headset requested
-    // (falls back to native 640x480); honor requested bitrate if provided.
-    int outW = config.width > 0 ? config.width : 640;
-    int outH = config.height > 0 ? config.height : 480;
+    // Scale the captured feed to whatever resolution the headset requested
+    // (falls back to native size); honor requested bitrate if provided.
+    int outW = config.width > 0 ? config.width : g_cap_width;
+    int outH = config.height > 0 ? config.height : g_cap_height;
     int bitrate = config.bitrate > 0 ? config.bitrate : 4000000;
 
     std::string pipeline_str =
-        "v4l2src device=/dev/video2 ! "
-        "video/x-raw,format=GRAY8,width=640,height=480,framerate=30/1 ! "
+        "v4l2src device=" + g_device + " ! "
+        "video/x-raw,format=" + g_pixfmt +
+        ",width=" + std::to_string(g_cap_width) +
+        ",height=" + std::to_string(g_cap_height) +
+        ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
         "videoconvert ! video/x-raw,format=NV12 ! "
         "nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width=" +
         std::to_string(outW) + ",height=" + std::to_string(outH) +
@@ -500,14 +510,30 @@ int main(int argc, char *argv[]) {
     if (arg == "--listen" && i + 1 < argc) {
       listen_enabled = true;
       listen_address = argv[++i];
+    } else if (arg == "--device" && i + 1 < argc) {
+      g_device = argv[++i];
+    } else if (arg == "--pixfmt" && i + 1 < argc) {
+      g_pixfmt = argv[++i];
+    } else if (arg == "--width" && i + 1 < argc) {
+      g_cap_width = std::stoi(argv[++i]);
+    } else if (arg == "--height" && i + 1 < argc) {
+      g_cap_height = std::stoi(argv[++i]);
+    } else if (arg == "--fps" && i + 1 < argc) {
+      g_cap_fps = std::stoi(argv[++i]);
     } else if (arg == "--help") {
-      std::cout << "Usage: " << argv[0] << " --listen IP:PORT\n"
-                << "  Serves the G1 head-camera IR feed to XRoboToolkit Remote "
-                   "Vision.\n"
+      std::cout << "Usage: " << argv[0] << " --listen IP:PORT [options]\n"
+                << "  Serves a V4L2 camera to XRoboToolkit Remote Vision.\n"
                 << "  The headset connects to IP:PORT, sends OPEN_CAMERA with "
                    "its\n"
                 << "  callback ip:port, and we stream H.264 back to it.\n"
-                << "  Example: " << argv[0] << " --listen 0.0.0.0:13579\n";
+                << "Options (defaults = D430i left-IR head cam):\n"
+                << "  --device /dev/video2   V4L2 node\n"
+                << "  --pixfmt GRAY8         GStreamer format (GRAY8, YUY2, UYVY)\n"
+                << "  --width 640 --height 480 --fps 30\n"
+                << "Examples:\n"
+                << "  " << argv[0] << " --listen 0.0.0.0:13579\n"
+                << "  " << argv[0] << " --listen 0.0.0.0:13580 --device /dev/video0"
+                   " --pixfmt YUY2 --width 1280 --height 704 --fps 15\n";
       return 0;
     }
   }
