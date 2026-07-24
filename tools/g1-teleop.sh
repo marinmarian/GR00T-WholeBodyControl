@@ -22,7 +22,9 @@ S=g1
 CONTROL_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_control_loop.py --interface real --no-with-hands --tracked_hands right'
 TELEOP_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_teleop_policy_loop.py --body_control_device quest --body_streamer_ip 127.0.0.1 --body_streamer_keyword wrist --hand_control_device None --tracked_hands right'
 BRIDGE_CMD='cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && python -u pico_vive_bridge.py --tracked_hands right --inspire-hands trigger'
-CAMERA_CMD='ssh g1 "pkill -9 -f OrinVideoSenderI[R]; sleep 1; cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579"'
+# NOTE: launch-only — no pkill in this string (the launch text itself would make a
+# remote pkill -f self-match and kill its own wrapper). Cleanup happens in up/down bodies.
+CAMERA_CMD='ssh g1 "cd ~/XRoboToolkit-Orin-Video-Sender && exec ./OrinVideoSenderIR --listen 0.0.0.0:13579"'
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 
 case "${1:-up}" in
@@ -49,6 +51,7 @@ up)
   tmux kill-session -t $S 2>/dev/null
   docker exec wbc-dev bash -c 'pkill -9 -f "run_teleop_policy_loo[p]"; pkill -9 -f "run_g1_control_loo[p]"' 2>/dev/null
   pkill -f pico_vive_bridge.py 2>/dev/null
+  ssh -o BatchMode=yes g1 'pkill -9 -f "OrinVideoSenderI[R]"' 2>/dev/null
   sleep 1
 
   # 3. svc window: xr-service | head-cam | bridge  (address panes by ID — index-proof)

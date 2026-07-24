@@ -378,8 +378,20 @@ void handleCloseCamera(const std::vector<uint8_t> &data) {
 void startStreamingThread() {
   std::lock_guard<std::mutex> lock(streaming_mutex);
   if (streaming_thread && streaming_thread->joinable()) {
-    std::cout << "Streaming thread already running" << std::endl;
-    return;
+    if (streaming_active.load()) {
+      // Genuinely still streaming: tear the old session down so a reconnecting
+      // headset (fresh OPEN_CAMERA) takes over instead of being refused.
+      std::cout << "Streaming thread running - restarting for new client" << std::endl;
+      streaming_active.store(false);
+    } else {
+      // Thread ended on its own (e.g. dead video socket) but was never joined.
+      std::cout << "Reaping finished streaming thread" << std::endl;
+    }
+    if (sender_ptr && sender_ptr->isConnected())
+      sender_ptr->disconnect();
+    sender_ptr = nullptr;
+    streaming_thread->join();
+    streaming_thread = nullptr;
   }
   streaming_active.store(true);
   streaming_thread = make_unique_helper<std::thread>(streamingThreadFunction);
