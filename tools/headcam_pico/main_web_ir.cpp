@@ -190,6 +190,14 @@ int g_cap_fps = 30;
 int g_flip = 0;   // rotation: 0=none 1=90ccw 2=180 3=90cw (CPU videoflip)
 bool g_letterbox = true;  // preserve aspect on the requested canvas (--fit stretch to disable)
 
+// Optional second camera -> side-by-side composite (primary left, secondary right)
+std::string g_device2 = "";
+std::string g_pixfmt2 = "GRAY8";
+int g_cap2_width = 640;
+int g_cap2_height = 480;
+int g_cap2_fps = 15;
+int g_flip2 = 0;
+
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_helper(Args &&...args) {
   return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
@@ -455,30 +463,7 @@ void streamingThreadFunction() {
     int effH = (g_flip == 1 || g_flip == 3) ? g_cap_width : g_cap_height;
     static const char *kFlip[] = {"", "counterclockwise", "rotate-180", "clockwise"};
 
-    std::string mid;
-    if (g_flip >= 1 && g_flip <= 3)
-      mid += std::string("videoflip method=") + kFlip[g_flip] + " ! ";
-    if (g_letterbox && (outW * effH != outH * effW)) {
-      // Scale to fit inside outW x outH, pad the rest with black bars.
-      double sc = std::min((double)outW / effW, (double)outH / effH);
-      int sw = ((int)(effW * sc) / 2) * 2, sh = ((int)(effH * sc) / 2) * 2;
-      int padL = (outW - sw) / 2, padR = outW - sw - padL;
-      int padT = (outH - sh) / 2, padB = outH - sh - padT;
-      mid += "videoscale ! video/x-raw,width=" + std::to_string(sw) +
-             ",height=" + std::to_string(sh) + " ! "
-             "videobox fill=black left=-" + std::to_string(padL) +
-             " right=-" + std::to_string(padR) +
-             " top=-" + std::to_string(padT) +
-             " bottom=-" + std::to_string(padB) + " ! ";
-    }
-
-    std::string pipeline_str =
-        "v4l2src device=" + g_device + " ! "
-        "video/x-raw,format=" + g_pixfmt +
-        ",width=" + std::to_string(g_cap_width) +
-        ",height=" + std::to_string(g_cap_height) +
-        ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
-        "videoconvert ! video/x-raw,format=I420 ! " + mid +
+    std::string encode_tail =
         "videoconvert ! video/x-raw,format=NV12 ! "
         "nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width=" +
         std::to_string(outW) + ",height=" + std::to_string(outH) +
@@ -488,6 +473,75 @@ void streamingThreadFunction() {
         std::to_string(bitrate) +
         " ! "
         "h264parse ! appsink name=mysink emit-signals=true sync=false";
+
+    std::string pipeline_str;
+    if (!g_device2.empty()) {
+      // Dual-camera composite: primary letterboxed into the LEFT half of the
+      // canvas, secondary into the RIGHT half (compositor sink pads scale).
+      int eff2W = (g_flip2 == 1 || g_flip2 == 3) ? g_cap2_height : g_cap2_width;
+      int eff2H = (g_flip2 == 1 || g_flip2 == 3) ? g_cap2_width : g_cap2_height;
+      int halfW = outW / 2;
+      auto fit = [&](int ew, int eh, int xoff, int &w, int &h, int &x, int &y) {
+        double sc = std::min((double)halfW / ew, (double)outH / eh);
+        w = ((int)(ew * sc) / 2) * 2;
+        h = ((int)(eh * sc) / 2) * 2;
+        x = xoff + (halfW - w) / 2;
+        y = (outH - h) / 2;
+      };
+      int w0, h0, x0, y0, w1, h1, x1, y1;
+      fit(effW, effH, 0, w0, h0, x0, y0);
+      fit(eff2W, eff2H, halfW, w1, h1, x1, y1);
+
+      std::string flip1 = (g_flip >= 1 && g_flip <= 3)
+          ? std::string("videoflip method=") + kFlip[g_flip] + " ! " : "";
+      std::string flip2 = (g_flip2 >= 1 && g_flip2 <= 3)
+          ? std::string("videoflip method=") + kFlip[g_flip2] + " ! " : "";
+
+      pipeline_str =
+          "compositor name=comp background=black "
+          "sink_0::xpos=" + std::to_string(x0) + " sink_0::ypos=" + std::to_string(y0) +
+          " sink_0::width=" + std::to_string(w0) + " sink_0::height=" + std::to_string(h0) +
+          " sink_1::xpos=" + std::to_string(x1) + " sink_1::ypos=" + std::to_string(y1) +
+          " sink_1::width=" + std::to_string(w1) + " sink_1::height=" + std::to_string(h1) +
+          " ! video/x-raw,format=I420,width=" + std::to_string(outW) +
+          ",height=" + std::to_string(outH) + " ! " + encode_tail +
+          "  v4l2src device=" + g_device + " ! "
+          "video/x-raw,format=" + g_pixfmt +
+          ",width=" + std::to_string(g_cap_width) +
+          ",height=" + std::to_string(g_cap_height) +
+          ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
+          "videoconvert ! video/x-raw,format=I420 ! " + flip1 + "comp.sink_0"
+          "  v4l2src device=" + g_device2 + " ! "
+          "video/x-raw,format=" + g_pixfmt2 +
+          ",width=" + std::to_string(g_cap2_width) +
+          ",height=" + std::to_string(g_cap2_height) +
+          ",framerate=" + std::to_string(g_cap2_fps) + "/1 ! "
+          "videoconvert ! video/x-raw,format=I420 ! " + flip2 + "comp.sink_1";
+    } else {
+      std::string mid;
+      if (g_flip >= 1 && g_flip <= 3)
+        mid += std::string("videoflip method=") + kFlip[g_flip] + " ! ";
+      if (g_letterbox && (outW * effH != outH * effW)) {
+        // Scale to fit inside outW x outH, pad the rest with black bars.
+        double sc = std::min((double)outW / effW, (double)outH / effH);
+        int sw = ((int)(effW * sc) / 2) * 2, sh = ((int)(effH * sc) / 2) * 2;
+        int padL = (outW - sw) / 2, padR = outW - sw - padL;
+        int padT = (outH - sh) / 2, padB = outH - sh - padT;
+        mid += "videoscale ! video/x-raw,width=" + std::to_string(sw) +
+               ",height=" + std::to_string(sh) + " ! "
+               "videobox fill=black left=-" + std::to_string(padL) +
+               " right=-" + std::to_string(padR) +
+               " top=-" + std::to_string(padT) +
+               " bottom=-" + std::to_string(padB) + " ! ";
+      }
+      pipeline_str =
+          "v4l2src device=" + g_device + " ! "
+          "video/x-raw,format=" + g_pixfmt +
+          ",width=" + std::to_string(g_cap_width) +
+          ",height=" + std::to_string(g_cap_height) +
+          ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
+          "videoconvert ! video/x-raw,format=I420 ! " + mid + encode_tail;
+    }
     std::cout << "Pipeline: " << pipeline_str << std::endl;
 
     GError *error = nullptr;
@@ -550,6 +604,18 @@ int main(int argc, char *argv[]) {
       g_flip = std::stoi(argv[++i]);
     } else if (arg == "--fit" && i + 1 < argc) {
       g_letterbox = std::string(argv[++i]) != "stretch";
+    } else if (arg == "--second-device" && i + 1 < argc) {
+      g_device2 = argv[++i];
+    } else if (arg == "--second-pixfmt" && i + 1 < argc) {
+      g_pixfmt2 = argv[++i];
+    } else if (arg == "--second-width" && i + 1 < argc) {
+      g_cap2_width = std::stoi(argv[++i]);
+    } else if (arg == "--second-height" && i + 1 < argc) {
+      g_cap2_height = std::stoi(argv[++i]);
+    } else if (arg == "--second-fps" && i + 1 < argc) {
+      g_cap2_fps = std::stoi(argv[++i]);
+    } else if (arg == "--second-flip" && i + 1 < argc) {
+      g_flip2 = std::stoi(argv[++i]);
     } else if (arg == "--help") {
       std::cout << "Usage: " << argv[0] << " --listen IP:PORT [options]\n"
                 << "  Serves a V4L2 camera to XRoboToolkit Remote Vision.\n"

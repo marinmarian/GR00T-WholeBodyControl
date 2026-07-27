@@ -24,7 +24,7 @@ TELEOP_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_teleop_po
 BRIDGE_CMD='cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && python -u pico_vive_bridge.py --tracked_hands right --inspire-hands trigger'
 # NOTE: launch-only — no pkill in this string (the launch text itself would make a
 # remote pkill -f self-match and kill its own wrapper). Cleanup happens in up/down bodies.
-CAMERA_CMD='ssh g1 "cd ~/XRoboToolkit-Orin-Video-Sender && exec ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device /dev/video0 --pixfmt YUY2 --width 704 --height 1280 --fps 15"'
+CAMERA_CMD='ssh g1 "cd ~/XRoboToolkit-Orin-Video-Sender && exec ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device /dev/v4l/by-id/usb-Intel_Intel_F450_00.00.01-video-index0 --pixfmt YUY2 --width 704 --height 1280 --fps 15 --second-device /dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_Intel_R__RealSense_TM__Depth_Camera_430i_349623061587-video-index2 --second-pixfmt GRAY8 --second-width 640 --second-height 480 --second-fps 15"'
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 
 case "${1:-up}" in
