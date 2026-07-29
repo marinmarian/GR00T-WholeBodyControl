@@ -118,11 +118,33 @@ class ViveStreamer(BaseStreamer):
 
         except zmq.ZMQError as e:
             print(f"ZMQ Error while requesting Vive data: {e}")
+            combined_data = None
 
-        # Return structured output - Vive only provides IK data
+        # Locomotion: quest/pico bridges also stream thumbstick axes; map them to
+        # navigate_cmd exactly like PicoStreamer (deadzone + velocity caps). Only
+        # emitted when joystick keys are present, so plain-vive behavior (and the
+        # keyboard w/s/a/d/q/e path) is unchanged.
+        control_data = {}
+        lj = combined_data.get("left_joystick") if combined_data else None
+        rj = combined_data.get("right_joystick") if combined_data else None
+        if lj is not None and rj is not None:
+            DEAD_ZONE = 0.1
+            MAX_LINEAR_VEL = 0.5  # m/s
+            MAX_ANGULAR_VEL = 1.0  # rad/s
+
+            def _dz(v):
+                return 0.0 if abs(v) < DEAD_ZONE else v
+
+            control_data["navigate_cmd"] = [
+                _dz(lj[1]) * MAX_LINEAR_VEL,   # left stick fwd/back -> vx
+                _dz(-lj[0]) * MAX_LINEAR_VEL,  # left stick strafe   -> vy
+                _dz(-rj[0]) * MAX_ANGULAR_VEL, # right stick x       -> yaw rate
+            ]
+
+        # Return structured output
         return StreamerOutput(
             ik_data=ik_data,
-            control_data={},  # No control commands from Vive
+            control_data=control_data,
             teleop_data={},  # No teleop commands from Vive
             source="vive",
         )

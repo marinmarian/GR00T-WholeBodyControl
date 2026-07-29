@@ -144,6 +144,10 @@ def main():
             rc = xrt.get_right_controller_pose()
             out[f"left_{kw}"] = _side_json(lc, head)
             out[f"right_{kw}"] = _side_json(rc, head)
+            # Thumbstick axes for locomotion (ViveStreamer maps them to navigate_cmd;
+            # zeros when idle/disconnected -> zero velocity, safe failure mode)
+            out["left_joystick"] = [float(v) for v in xrt.get_left_axis()]
+            out["right_joystick"] = [float(v) for v in xrt.get_right_axis()]
             now = time.monotonic()
             if now - last_log > 1.0:
                 last_log = now
