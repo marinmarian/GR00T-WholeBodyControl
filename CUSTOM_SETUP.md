@@ -30,7 +30,21 @@ is specific to our machine **mjolnir** (Jetson AGX Thor backpack) driving a Unit
   sudo iptables -I FORWARD 1 -i wlP1p1s0 -j ACCEPT
   sudo iptables -I FORWARD 1 -o wlP1p1s0 -j ACCEPT
   ```
-  (Not needed for the PICO/XRoboToolkit path — that's a local link, no internet required.)
+  **PICO / XRoboToolkit on the hotspot (recommended for latency):** the room router adds
+  65–175 ms to the headset vs ~1.6 ms on the hotspot — noticeable in both tracking and the
+  Remote Vision camera stream. Setup (redo after any mjolnir reboot, AFTER docker is up
+  since Docker resets the FORWARD policy to DROP):
+  ```bash
+  sudo nmcli con up quest-hotspot
+  sudo iptables -I FORWARD 1 -i wlP1p1s0 -j ACCEPT
+  sudo iptables -I FORWARD 1 -o wlP1p1s0 -j ACCEPT
+  # on the robot PC, so camera video can reach the headset across subnets:
+  ssh g1 'sudo ip route add 10.42.0.0/24 via 192.168.123.222'
+  ```
+  PICO joins `mjolnir-xr` (it will warn "no internet" — keep the connection; add the
+  MASQUERADE rule above only if headset internet is wanted). In the app: **PC service =
+  `10.42.0.1`** (not .222), Remote Vision stays `192.168.123.164`. Verified working with
+  the full right-arm-IK + dual-camera stack 2026-07-27.
 
 ---
 

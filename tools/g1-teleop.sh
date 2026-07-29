@@ -14,7 +14,7 @@
 #   control loop -> teleop loop (waits for bridge :5555 + control loop in container)
 #
 # Manual steps that stay manual:
-#   * PICO app: PC service 192.168.123.222 (WORKING) + Remote Vision -> 192.168.123.164
+#   * PICO app: PC service = 10.42.0.1 (hotspot) or 192.168.123.222 (wired) + Remote Vision -> 192.168.123.164
 #   * keys in run window: ]  = balance,  l = teleop on,  o = off   (L2+B = damp)
 #   * IGMP querier needs sudo: run it yourself if this script can't (it will tell you).
 
@@ -77,7 +77,8 @@ up)
   echo "Session '$S' is up.  Attach with:   tmux attach -t $S"
   echo "  window 'run' (you land here): LEFT pane = control loop -> press ] then l"
   echo "  window 'svc' (Ctrl-b n):      xr-service / head-cam / bridge logs"
-  echo "  PICO app: PC service 192.168.123.222 -> WORKING; Remote Vision -> 192.168.123.164"
+  echo "  PICO app: PC service = 10.42.0.1 (mjolnir-xr hotspot) or 192.168.123.222 (wired LAN)"
+  echo "            Remote Vision -> 192.168.123.164"
   echo "  DO NOT press l until the bridge pane shows moving 'R pos(...)'."
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
