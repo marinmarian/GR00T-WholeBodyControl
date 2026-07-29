@@ -187,6 +187,10 @@ std::string g_pixfmt = "GRAY8";  // GStreamer caps format: GRAY8, YUY2, UYVY, ..
 int g_cap_width = 640;
 int g_cap_height = 480;
 int g_cap_fps = 30;
+int g_max_bitrate = 8000000;  // cap the headset's requested bitrate (it asks 20 Mbps,
+                              // sized for wired; over WiFi that backlogs TCP -> lag)
+std::string g_video_via = "";  // connect video to this IP instead of the headset's
+                               // self-reported one (relay host, firewall bypass)
 int g_flip = 0;   // rotation: 0=none 1=90ccw 2=180 3=90cw (CPU videoflip)
 bool g_letterbox = true;  // preserve aspect on the requested canvas (--fit stretch to disable)
 
@@ -370,8 +374,10 @@ void handleOpenCamera(const std::vector<uint8_t> &data) {
       std::lock_guard<std::mutex> lock(config_mutex);
       current_camera_config = cameraConfig;
     }
-    send_to_server = cameraConfig.ip;
+    send_to_server = g_video_via.empty() ? cameraConfig.ip : g_video_via;
     send_to_port = cameraConfig.port;
+    if (!g_video_via.empty())
+      std::cout << "Video routed via relay " << g_video_via << std::endl;
     std::cout << "Updated sender target to " << send_to_server << ":"
               << send_to_port << std::endl;
     startStreamingThread();
@@ -457,6 +463,7 @@ void streamingThreadFunction() {
     int outW = config.width > 0 ? config.width : g_cap_width;
     int outH = config.height > 0 ? config.height : g_cap_height;
     int bitrate = config.bitrate > 0 ? config.bitrate : 4000000;
+    bitrate = std::min(bitrate, g_max_bitrate);
 
     // Effective source dims after rotation (90-degree flips swap W/H)
     int effW = (g_flip == 1 || g_flip == 3) ? g_cap_height : g_cap_width;
@@ -602,6 +609,10 @@ int main(int argc, char *argv[]) {
       g_cap_fps = std::stoi(argv[++i]);
     } else if (arg == "--flip" && i + 1 < argc) {
       g_flip = std::stoi(argv[++i]);
+    } else if (arg == "--max-bitrate" && i + 1 < argc) {
+      g_max_bitrate = std::stoi(argv[++i]);
+    } else if (arg == "--video-via" && i + 1 < argc) {
+      g_video_via = argv[++i];
     } else if (arg == "--fit" && i + 1 < argc) {
       g_letterbox = std::string(argv[++i]) != "stretch";
     } else if (arg == "--second-device" && i + 1 < argc) {

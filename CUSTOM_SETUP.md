@@ -43,7 +43,15 @@ is specific to our machine **mjolnir** (Jetson AGX Thor backpack) driving a Unit
   ```
   PICO joins `mjolnir-xr` (it will warn "no internet" — keep the connection; add the
   MASQUERADE rule above only if headset internet is wanted). In the app: **PC service =
-  `10.42.0.1`** (not .222), Remote Vision stays `192.168.123.164`. Verified working with
+  `10.42.0.1`** (not .222), Remote Vision stays `192.168.123.164`.
+
+  **Camera-video gotchas learned the hard way:** (1) the g1 route above is what makes the
+  camera stream reach the headset — persist it (`sudo nmcli con mod unitree1 +ipv4.routes
+  "10.42.0.0/24 192.168.123.222"` on the robot PC), because a plain `ip route add` was
+  silently lost and every "No route to host" of 2026-07-29 traced back to that; (2) do NOT
+  relay/proxy the video through another host — Remote Vision kills streams whose source IP
+  differs from the configured camera address after ~1-2 s (looks like a freeze); (3) the
+  sender caps the headset's requested 20 Mbps at 8 Mbps by default (`--max-bitrate`). Verified working with
   the full right-arm-IK + dual-camera stack 2026-07-27.
 
 ---

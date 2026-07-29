@@ -62,6 +62,10 @@ up)
   tmux send-keys -t "$P_XR"  "$XRSVC_CMD" C-m
   tmux send-keys -t "$P_CAM" "$CAMERA_CMD" C-m
   tmux send-keys -t "$P_BR"  "until pgrep -f RoboticsServiceProcess >/dev/null; do echo waiting for xr-service...; sleep 1; done; sleep 3; $BRIDGE_CMD" C-m
+  # NOTE (hotspot mode): camera video goes DIRECT g1 -> PICO and needs g1's route
+  # `10.42.0.0/24 via 192.168.123.222` (persisted in g1's NM profile). Do NOT relay
+  # the video through mjolnir: Remote Vision kills streams whose source IP differs
+  # from the configured camera address (~1-2 s freeze).
   tmux select-layout -t $S:svc tiled
 
   # 4. run window: control loop | teleop loop (keys go to the LEFT pane)
