@@ -24,7 +24,10 @@ TELEOP_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_teleop_po
 BRIDGE_CMD='cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && python -u pico_vive_bridge.py --tracked_hands right --inspire-hands trigger'
 # NOTE: launch-only — no pkill in this string (the launch text itself would make a
 # remote pkill -f self-match and kill its own wrapper). Cleanup happens in up/down bodies.
-CAMERA_CMD='ssh g1 "cd ~/XRoboToolkit-Orin-Video-Sender && exec ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device /dev/v4l/by-id/usb-Intel_Intel_F450_00.00.01-video-index0 --pixfmt YUY2 --width 704 --height 1280 --fps 15"'
+CAMERA_CMD='ssh g1 "cd ~/XRoboToolkit-Orin-Video-Sender && exec ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device /dev/v4l/by-id/usb-Intel_Intel_F450_00.00.01-video-index0 --pixfmt YUY2 --width 704 --height 1280 --fps 15 --zmq-pub 5555"'
+# Episode recorder (LeRobot format). Keys in the CONTROL-LOOP pane: c = start /
+# stop+save episode, x = discard. Dataset name/task via env: DATASET=, TASK=.
+EXPORTER_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 192.168.123.164 --camera-port 5555 --dataset-name '"${DATASET:-g1_teleop}"' --task-prompt "'"${TASK:-demo}"'" --no-add-stereo-camera --no-text-to-speech'
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 
 case "${1:-up}" in
@@ -49,7 +52,7 @@ up)
 
   # 2. clean slate for the session (leave igmp/container alone)
   tmux kill-session -t $S 2>/dev/null
-  docker exec wbc-dev bash -c 'pkill -9 -f "run_teleop_policy_loo[p]"; pkill -9 -f "run_g1_control_loo[p]"' 2>/dev/null
+  docker exec wbc-dev bash -c 'pkill -9 -f "run_teleop_policy_loo[p]"; pkill -9 -f "run_g1_control_loo[p]"; pkill -9 -f "run_g1_data_exporte[r]"' 2>/dev/null
   pkill -f pico_vive_bridge.py 2>/dev/null
   ssh -o BatchMode=yes g1 'pkill -9 -f "OrinVideoSenderI[R]"' 2>/dev/null
   sleep 1
@@ -74,6 +77,8 @@ up)
   P_TEL=$(tmux split-window -t "$P_CTL" -h -P -F '#{pane_id}')
   tmux send-keys -t "$P_CTL" "$CONTROL_CMD" C-m
   tmux send-keys -t "$P_TEL" "until (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null; do echo waiting for bridge...; sleep 1; done; until docker exec wbc-dev pgrep -f run_g1_control_loop >/dev/null; do echo waiting for control loop...; sleep 1; done; echo control loop up, giving it 12s...; sleep 12; $TELEOP_CMD" C-m
+  P_EXP=$(tmux split-window -t "$P_TEL" -v -P -F '#{pane_id}')
+  tmux send-keys -t "$P_EXP" "until docker exec wbc-dev pgrep -f run_g1_control_loop >/dev/null; do echo waiting for control loop...; sleep 1; done; sleep 15; $EXPORTER_CMD" C-m
   tmux select-window -t $S:run
   tmux select-pane   -t "$P_CTL"
 
@@ -84,11 +89,12 @@ up)
   echo "  PICO app: PC service = 10.42.0.1 (mjolnir-xr hotspot) or 192.168.123.222 (wired LAN)"
   echo "            Remote Vision -> 192.168.123.164"
   echo "  DO NOT press l until the bridge pane shows moving 'R pos(...)'."
+  echo "  Recording (control-loop pane): c = start / stop+save episode, x = discard."
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
 down)
   echo "!! Make sure the robot is deactivated ('o') and damped (L2+B) first."
-  docker exec wbc-dev bash -c 'pkill -f "run_teleop_policy_loo[p]"; sleep 1; pkill -f "run_g1_control_loo[p]"; sleep 1; pkill -9 -f "run_teleop_policy_loo[p]"; pkill -9 -f "run_g1_control_loo[p]"' 2>/dev/null
+  docker exec wbc-dev bash -c 'pkill -f "run_g1_data_exporte[r]"; pkill -f "run_teleop_policy_loo[p]"; sleep 2; pkill -f "run_g1_control_loo[p]"; sleep 1; pkill -9 -f "run_teleop_policy_loo[p]"; pkill -9 -f "run_g1_control_loo[p]"; pkill -9 -f "run_g1_data_exporte[r]"' 2>/dev/null
   sleep 1
   tmux kill-session -t $S 2>/dev/null
   pkill -f pico_vive_bridge.py 2>/dev/null
@@ -106,6 +112,7 @@ status)
   echo -n "pico bridge:    "; pgrep -f pico_vive_bridge.py >/dev/null && echo UP || echo down
   echo -n "control loop:   "; docker exec wbc-dev pgrep -f run_g1_control_loop >/dev/null 2>&1 && echo UP || echo down
   echo -n "teleop loop:    "; docker exec wbc-dev pgrep -f run_teleop_policy_loop >/dev/null 2>&1 && echo UP || echo down
+  echo -n "data exporter:  "; docker exec wbc-dev pgrep -f run_g1_data_exporter >/dev/null 2>&1 && echo UP || echo down
   echo -n "head-cam (g1):  "; ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pgrep -f "OrinVideoSenderI[R]" >/dev/null' 2>/dev/null && echo UP || echo down
   echo -n "right hand:     "; timeout 1 bash -c 'echo > /dev/tcp/192.168.123.211/6000' 2>/dev/null && echo UP || echo down
   ;;

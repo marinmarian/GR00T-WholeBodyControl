@@ -91,12 +91,26 @@ class Gr00tDataCollector:
 
         self.node = node
 
+        # Subscribe for recording keys directly on our own node, BEFORE the spin
+        # thread starts: KeyboardListenerSubscriber attaches to whatever node the
+        # global executor lists first, which in this process never gets callbacks.
+        from std_msgs.msg import String as _RosStringMsg
+        from decoupled_wbc.control.utils.keyboard_dispatcher import (
+            KEYBOARD_LISTENER_TOPIC_NAME as _KEY_TOPIC,
+        )
+        self._latest_key = None
+
+        def _on_key(msg):
+            self._latest_key = msg.data
+
+        self.node.create_subscription(_RosStringMsg, _KEY_TOPIC, _on_key, 1)
+
         thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
         thread.start()
         time.sleep(0.5)
 
         self._episode_state = EpisodeState()
-        self._keyboard_listener = KeyboardListenerSubscriber()
+        self._last_saved_index = None
         self._state_subscriber = ROSMsgSubscriber(state_topic_name)
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
         self.rate = self.node.create_rate(self.frequency)
@@ -125,7 +139,7 @@ class Gr00tDataCollector:
             print(message)
 
     def _check_keyboard_input(self):
-        key = self._keyboard_listener.read_msg()
+        key, self._latest_key = self._latest_key, None
         if key == "c":
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
@@ -139,6 +153,23 @@ class Gr00tDataCollector:
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._print_and_say("Discarded episode")
+        elif key in ("g", "v", "b"):
+            # Rate the most recently saved episode: g = good, v = neutral, b = bad.
+            rating = {"g": "good", "v": "neutral", "b": "bad"}[key]
+            if self._last_saved_index is None:
+                self._print_and_say("No saved episode to rate yet")
+            else:
+                import json as _json
+
+                ratings_path = self.data_exporter.meta.root / "meta" / "ratings.jsonl"
+                with open(ratings_path, "a") as f:
+                    f.write(
+                        _json.dumps(
+                            {"episode_index": self._last_saved_index, "rating": rating}
+                        )
+                        + "\n"
+                    )
+                self._print_and_say(f"Rated episode {self._last_saved_index}: {rating}")
 
     def _add_data_frame(self):
         t_start = time.monotonic()
@@ -204,9 +235,16 @@ class Gr00tDataCollector:
             print(f"DataExporter Missed: {t_end - t_start} sec")
 
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-            self.data_exporter.save_episode()
+            if self.data_exporter.episode_buffer.get("size", 0) == 0:
+                # Nothing was captured (e.g. camera feed absent) - saving an empty
+                # episode crashes lerobot; drop it instead of dying.
+                self._print_and_say("Episode is EMPTY (no frames captured) - dropping it")
+            else:
+                self._last_saved_index = self.data_exporter.episode_buffer["episode_index"]
+                self.data_exporter.save_episode()
+                self._print_and_say(
+                    f"Finished saving episode {self._last_saved_index} - rate it: g=good v=neutral b=bad")
             self.timing_threshold_monitor.reset()
-            self._print_and_say("Finished saving episode")
             self._episode_state.change_state()
 
         return True
@@ -253,7 +291,9 @@ class Gr00tDataCollector:
 
                     end_time = time.monotonic()
 
-                self.rate.sleep()
+                # plain pacing: the ROS rate timer is not serviced reliably in this
+                # process (loop froze after one iteration) -> use wall clock
+                time.sleep(max(0.0, (1.0 / self.frequency) - (time.monotonic() - t_start)))
 
                 # Log timing information if we missed our target frequency
                 if (end_time - t_start) > (1 / self.frequency):

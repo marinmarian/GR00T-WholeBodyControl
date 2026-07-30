@@ -24,6 +24,9 @@
 #include <thread>
 #include <vector>
 
+#include <sys/time.h>
+#include <zmq.h>
+
 #include "network_helper.hpp"
 
 // ---------------------------------------------------------------------------
@@ -194,6 +197,15 @@ std::string g_video_via = "";  // connect video to this IP instead of the headse
 int g_flip = 0;   // rotation: 0=none 1=90ccw 2=180 3=90cw (CPU videoflip)
 bool g_letterbox = true;  // preserve aspect on the requested canvas (--fit stretch to disable)
 
+// --zmq-pub PORT: tee the capture into 20 Hz 640x480 JPEGs published over the
+// decoupled_wbc composed-camera ZMQ protocol (msgpack, image key "ego_view"),
+// so run_g1_data_exporter can record episodes from the same camera that feeds
+// the headset. Frames flow only while a Remote Vision session is streaming.
+int g_zmq_pub_port = 0;
+void *g_zmq_ctx = nullptr;
+void *g_zmq_pub = nullptr;
+const int DATA_W = 640, DATA_H = 480;  // dataset ego_view shape (RS_VIEW_*)
+
 // Optional second camera -> side-by-side composite (primary left, secondary right)
 std::string g_device2 = "";
 std::string g_pixfmt2 = "GRAY8";
@@ -269,6 +281,57 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
         streaming_active.store(false);
       }
     }
+    gst_buffer_unmap(buffer, &map);
+  }
+  gst_sample_unref(sample);
+  return GST_FLOW_OK;
+}
+
+// msgpack for {"timestamps":{"ego_view":<f64>},"images":{"ego_view":<bin jpeg>}}
+static void publish_data_frame(const uint8_t *jpeg, size_t len) {
+  if (!g_zmq_pub)
+    return;
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  double ts = tv.tv_sec + tv.tv_usec / 1e6;
+
+  std::vector<uint8_t> m;
+  m.reserve(len + 64);
+  auto put_str = [&](const char *str) {
+    size_t n = strlen(str);
+    m.push_back(0xa0 | (uint8_t)n);  // fixstr (all our keys are < 32 chars)
+    m.insert(m.end(), str, str + n);
+  };
+  m.push_back(0x82);  // map(2)
+  put_str("timestamps");
+  m.push_back(0x81);  // map(1)
+  put_str("ego_view");
+  m.push_back(0xcb);  // float64, big-endian
+  uint64_t bits;
+  memcpy(&bits, &ts, 8);
+  for (int i = 7; i >= 0; --i)
+    m.push_back((bits >> (i * 8)) & 0xFF);
+  put_str("images");
+  m.push_back(0x81);  // map(1)
+  put_str("ego_view");
+  m.push_back(0xc6);  // bin32
+  m.push_back((len >> 24) & 0xFF);
+  m.push_back((len >> 16) & 0xFF);
+  m.push_back((len >> 8) & 0xFF);
+  m.push_back(len & 0xFF);
+  m.insert(m.end(), jpeg, jpeg + len);
+  zmq_send(g_zmq_pub, m.data(), m.size(), ZMQ_DONTWAIT);
+}
+
+GstFlowReturn on_new_data_sample(GstAppSink *sink, gpointer user_data) {
+  (void)user_data;
+  GstSample *sample = gst_app_sink_pull_sample(sink);
+  if (!sample)
+    return GST_FLOW_ERROR;
+  GstBuffer *buffer = gst_sample_get_buffer(sample);
+  GstMapInfo map;
+  if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+    publish_data_frame(map.data, map.size);
     gst_buffer_unmap(buffer, &map);
   }
   gst_sample_unref(sample);
@@ -481,6 +544,25 @@ void streamingThreadFunction() {
         " ! "
         "h264parse ! appsink name=mysink emit-signals=true sync=false";
 
+    // Optional data tee: 20 Hz letterboxed 640x480 JPEGs -> ZMQ (episode recording)
+    std::string data_branch;
+    if (g_zmq_pub_port > 0) {
+      double dsc = std::min((double)DATA_W / effW, (double)DATA_H / effH);
+      int dw = ((int)(effW * dsc) / 2) * 2, dh = ((int)(effH * dsc) / 2) * 2;
+      int dl = (DATA_W - dw) / 2, dr = DATA_W - dw - dl;
+      int dt = (DATA_H - dh) / 2, db = DATA_H - dh - dt;
+      data_branch =
+          "tee name=datatee ! queue leaky=downstream max-size-buffers=2 ! "
+          "videoscale ! video/x-raw,width=" + std::to_string(dw) +
+          ",height=" + std::to_string(dh) + " ! "
+          "videobox fill=black left=-" + std::to_string(dl) +
+          " right=-" + std::to_string(dr) +
+          " top=-" + std::to_string(dt) +
+          " bottom=-" + std::to_string(db) + " ! "
+          "jpegenc quality=85 ! appsink name=datasink emit-signals=true sync=false "
+          "datatee. ! queue ! ";
+    }
+
     std::string pipeline_str;
     if (!g_device2.empty()) {
       // Dual-camera composite: primary letterboxed into the LEFT half of the
@@ -517,7 +599,7 @@ void streamingThreadFunction() {
           ",width=" + std::to_string(g_cap_width) +
           ",height=" + std::to_string(g_cap_height) +
           ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
-          "videoconvert ! video/x-raw,format=I420 ! " + flip1 + "comp.sink_0"
+          "videoconvert ! video/x-raw,format=I420 ! " + flip1 + data_branch + "comp.sink_0"
           "  v4l2src device=" + g_device2 + " ! "
           "video/x-raw,format=" + g_pixfmt2 +
           ",width=" + std::to_string(g_cap2_width) +
@@ -547,7 +629,7 @@ void streamingThreadFunction() {
           ",width=" + std::to_string(g_cap_width) +
           ",height=" + std::to_string(g_cap_height) +
           ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
-          "videoconvert ! video/x-raw,format=I420 ! " + mid + encode_tail;
+          "videoconvert ! video/x-raw,format=I420 ! " + data_branch + mid + encode_tail;
     }
     std::cout << "Pipeline: " << pipeline_str << std::endl;
 
@@ -567,6 +649,11 @@ void streamingThreadFunction() {
       return;
     }
     g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), nullptr);
+    GstElement *datasink = gst_bin_get_by_name(GST_BIN(pipeline), "datasink");
+    if (datasink) {
+      g_signal_connect(datasink, "new-sample", G_CALLBACK(on_new_data_sample), nullptr);
+      gst_object_unref(datasink);
+    }
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
     std::cout << "Streaming IR feed to " << send_to_server << ":"
@@ -609,6 +696,8 @@ int main(int argc, char *argv[]) {
       g_cap_fps = std::stoi(argv[++i]);
     } else if (arg == "--flip" && i + 1 < argc) {
       g_flip = std::stoi(argv[++i]);
+    } else if (arg == "--zmq-pub" && i + 1 < argc) {
+      g_zmq_pub_port = std::stoi(argv[++i]);
     } else if (arg == "--max-bitrate" && i + 1 < argc) {
       g_max_bitrate = std::stoi(argv[++i]);
     } else if (arg == "--video-via" && i + 1 < argc) {
@@ -650,6 +739,18 @@ int main(int argc, char *argv[]) {
                  "(e.g. --listen 0.0.0.0:13579)\n";
     std::cerr << "Use --help to see usage options" << std::endl;
     return -1;
+  }
+
+  if (g_zmq_pub_port > 0) {
+    g_zmq_ctx = zmq_ctx_new();
+    g_zmq_pub = zmq_socket(g_zmq_ctx, ZMQ_PUB);
+    std::string ep = "tcp://*:" + std::to_string(g_zmq_pub_port);
+    if (zmq_bind(g_zmq_pub, ep.c_str()) != 0) {
+      std::cerr << "zmq bind failed on " << ep << std::endl;
+      return -1;
+    }
+    std::cout << "Publishing ego_view JPEGs (composed-camera protocol) on " << ep
+              << std::endl;
   }
 
   std::cout << "Starting IR video streaming server (listen " << listen_address

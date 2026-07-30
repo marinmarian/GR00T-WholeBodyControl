@@ -37,7 +37,7 @@ class ImageMessageSchema:
         timestamps = data.get("timestamps", {})
         images = {}
         for key, value in data.get("images", {}).items():
-            if isinstance(value, str):
+            if isinstance(value, (str, bytes, bytearray)):
                 images[key] = ImageUtils.decode_image(value)
             else:
                 images[key] = value
@@ -86,6 +86,9 @@ class SensorClient:
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self.socket.setsockopt(zmq.CONFLATE, True)  # last msg only.
         self.socket.setsockopt(zmq.RCVHWM, 3)  # queue size 3 for receive buffer
+        # Never block forever: the camera publisher may be idle (e.g. no Remote
+        # Vision session streaming) and a blocking recv() freezes the consumer.
+        self.socket.setsockopt(zmq.RCVTIMEO, 100)
         self.socket.connect(f"tcp://{server_ip}:{port}")
 
     def stop_client(self):
@@ -93,7 +96,10 @@ class SensorClient:
         self.context.term()
 
     def receive_message(self):
-        packed = self.socket.recv()
+        try:
+            packed = self.socket.recv()
+        except zmq.Again:
+            return None
         return msgpack.unpackb(packed, object_hook=m.decode)
 
 
@@ -116,8 +122,10 @@ class ImageUtils:
         return base64.b64encode(depth_compressed).decode("utf-8")
 
     @staticmethod
-    def decode_image(image: str) -> np.ndarray:
-        color_data = base64.b64decode(image)
+    def decode_image(image) -> np.ndarray:
+        # Accept raw JPEG bytes (e.g. from the OrinVideoSenderIR --zmq-pub tee,
+        # which skips the base64 detour) as well as base64-encoded strings.
+        color_data = image if isinstance(image, (bytes, bytearray)) else base64.b64decode(image)
         color_array = np.frombuffer(color_data, dtype=np.uint8)
         return cv2.imdecode(color_array, cv2.IMREAD_COLOR)
 
