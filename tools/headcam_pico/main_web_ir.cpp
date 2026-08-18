@@ -586,6 +586,25 @@ void streamingThreadFunction() {
       std::string flip2 = (g_flip2 >= 1 && g_flip2 <= 3)
           ? std::string("videoflip method=") + kFlip[g_flip2] + " ! " : "";
 
+      // Second source may be a network stream instead of a local V4L2 node:
+      // --second-device udp:PORT expects RTP/MJPEG (rtpjpegpay) on that port,
+      // e.g. pushed from another host with:
+      //   gst-launch-1.0 v4l2src ! ... ! jpegenc ! rtpjpegpay ! udpsink host=<this> port=PORT
+      std::string src2;
+      if (g_device2.rfind("udp:", 0) == 0) {
+        std::string port2 = g_device2.substr(4);
+        src2 = "udpsrc port=" + port2 +
+               " caps=application/x-rtp,media=video,encoding-name=JPEG,payload=26 ! "
+               "rtpjpegdepay ! jpegdec ! videoconvert ! video/x-raw,format=I420 ! ";
+      } else {
+        src2 = "v4l2src device=" + g_device2 + " ! "
+               "video/x-raw,format=" + g_pixfmt2 +
+               ",width=" + std::to_string(g_cap2_width) +
+               ",height=" + std::to_string(g_cap2_height) +
+               ",framerate=" + std::to_string(g_cap2_fps) + "/1 ! "
+               "videoconvert ! video/x-raw,format=I420 ! ";
+      }
+
       pipeline_str =
           "compositor name=comp background=black "
           "sink_0::xpos=" + std::to_string(x0) + " sink_0::ypos=" + std::to_string(y0) +
@@ -600,12 +619,7 @@ void streamingThreadFunction() {
           ",height=" + std::to_string(g_cap_height) +
           ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
           "videoconvert ! video/x-raw,format=I420 ! " + flip1 + data_branch + "comp.sink_0"
-          "  v4l2src device=" + g_device2 + " ! "
-          "video/x-raw,format=" + g_pixfmt2 +
-          ",width=" + std::to_string(g_cap2_width) +
-          ",height=" + std::to_string(g_cap2_height) +
-          ",framerate=" + std::to_string(g_cap2_fps) + "/1 ! "
-          "videoconvert ! video/x-raw,format=I420 ! " + flip2 + "comp.sink_1";
+          "  " + src2 + flip2 + "comp.sink_1";
     } else {
       std::string mid;
       if (g_flip >= 1 && g_flip <= 3)
