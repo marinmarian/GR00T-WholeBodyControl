@@ -595,7 +595,9 @@ void streamingThreadFunction() {
         std::string port2 = g_device2.substr(4);
         src2 = "udpsrc port=" + port2 +
                " caps=application/x-rtp,media=video,encoding-name=JPEG,payload=26 ! "
-               "rtpjpegdepay ! jpegdec ! videoconvert ! video/x-raw,format=I420 ! ";
+               "rtpjitterbuffer latency=80 ! "
+               "rtpjpegdepay ! jpegdec ! videoconvert ! video/x-raw,format=I420 ! "
+               "queue leaky=downstream max-size-buffers=3 ! ";
       } else {
         src2 = "v4l2src device=" + g_device2 + " ! "
                "video/x-raw,format=" + g_pixfmt2 +
