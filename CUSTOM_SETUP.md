@@ -63,14 +63,19 @@ This package drives them **independently** of the body pipeline, over Modbus TCP
 
 - `inspire_hand_modbus.py` — vendored Modbus TCP driver (hands at `192.168.123.210` /
   `.211`, port 6000; `1000` = open, `0` = closed).
-- `inspire_bridge.py` — `InspireBridge`, a ~60 Hz daemon mapping controller inputs to finger
-  angles: **trigger → 4‑finger curl, grip/squeeze → thumb**. Works in any stream mode and
-  with either input source. Opens hands and disconnects on exit.
+- `inspire_bridge.py` — `InspireBridge`, a ~90 Hz (one-hand average) daemon mapping
+  controller inputs to finger angles: **trigger → 4‑finger curl, grip/squeeze → thumb**.
+  Cruise `FORCE_SET` = rest `FORCE_ACT` + 400 g; stall **holds** (no +40 retract);
+  wrap tracks the trigger desired angle. `EMA_ALPHA=0.5` smooths cmd (not raw trigger).
+- `inspire_dump.py` — ZMQ PUB `127.0.0.1:5558` topics `inspire_hand` / `inspire_tactile`
+  (LINGER=0); last-run log `inspire-last-run.log`. No ROS topic. One Modbus client.
 - `test_hands.py` — standalone connectivity check (`--cycle` opens/closes both hands).
 
-Enable in the streamer with `--inspire-hands trigger`. It runs alongside the (inert, Dex3)
-deploy output; for the decoupled_wbc pipeline run that with `--no-with-hands` and let this
-bridge own the hands.
+Enable in the streamer with `--inspire-hands trigger`. This rig: `TRACKED_HANDS=right`.
+Leftover process: `pgrep -af pico_vive_bridge` then `kill PID` (ports 5555/5556/5558);
+do not kill the XR service. Dual-hand sequential Modbus cannot hold 90 Hz.
+It runs alongside the (inert, Dex3) deploy output; for the decoupled_wbc pipeline
+run that with `--no-with-hands` and let this bridge own the hands.
 
 ---
 

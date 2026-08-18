@@ -409,6 +409,24 @@ class InspireHandModbusTCP:
             "final_angles": self.read_angles(),
         }
 
+    def read_tactile_tip_peaks(self):
+        """Peak taxel on each fingertip pad only (3x3, 9 registers / region).
+
+        Skips palm. Cheap enough when rate-limited in the teleop loop;
+        full-array ``read_tactile_peaks`` is too heavy at 90 Hz. Returns
+        {region_name: peak int} or None on error.
+        """
+        out = {}
+        for name, region in TACTILE_REGIONS.items():
+            if name == "palm":
+                continue
+            _pad_name, rows, cols = region["pads"][0]
+            vals = self._read_registers(region["base"], rows * cols)
+            if vals is None:
+                return None
+            out[name] = max(vals) if vals else 0
+        return out
+
     def read_tactile_peaks(self):
         """Return {region: peak int} (max taxel value per region), or None."""
         tac = self.read_tactile()

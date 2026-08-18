@@ -38,6 +38,15 @@ from scipy.spatial.transform import Rotation as R
 import zmq
 import xrobotoolkit_sdk as xrt
 
+from gear_sonic.utils.teleop.inspire.inspire_bridge import (
+    HANDS_RATE_HZ,
+    InspireBridge,
+)
+from gear_sonic.utils.teleop.inspire.inspire_dump import (
+    INSPIRE_DUMP_PORT,
+    InspireDumpPublisher,
+)
+
 # XR (Y-up) -> robot world (Z-up); identical to decoupled_wbc PicoStreamer.
 R_HEADSET_TO_WORLD = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]])
 
@@ -100,75 +109,108 @@ def main():
     ap.add_argument("--tracked_hands", "--tracked-hands", dest="tracked_hands",
                     type=str, default="both", choices=["both", "left", "right"],
                     help="Which side's Inspire hand to drive (poses always stream both)")
+    ap.add_argument("--tap-port", type=int, default=5556,
+                    help="ZMQ PUB copy of each vive frame for xr_rerun_logger; 0 disables")
+    ap.add_argument("--inspire-dump-port", type=int, default=INSPIRE_DUMP_PORT,
+                    help="ZMQ PUB dump of Inspire cmd/actual/force + tactile; 0 disables")
     args = ap.parse_args()
-
-    print("[pico-bridge] xrt.init() -- the PICO PC service must already be running "
-          "(~/start_xrsvc.sh) and the PICO app connected ...", flush=True)
-    xrt.init()
 
     tracked = {"both": ["left", "right"], "left": ["left"], "right": ["right"]}[args.tracked_hands]
 
-    inspire = None
-    if args.inspire_hands != "off":
-        from gear_sonic.utils.teleop.inspire.inspire_bridge import InspireBridge
-
-        def _hand_inputs():
-            # (menu, left_trigger, right_trigger, left_grip, right_grip); untracked side forced open
-            lt = xrt.get_left_trigger() if "left" in tracked else 0.0
-            lg = xrt.get_left_grip() if "left" in tracked else 0.0
-            rt = xrt.get_right_trigger() if "right" in tracked else 0.0
-            rg = xrt.get_right_grip() if "right" in tracked else 0.0
-            return (False, lt, rt, lg, rg)
-
-        inspire = InspireBridge(get_inputs=_hand_inputs, mode="trigger")
-        inspire.start()
-
     ctx = zmq.Context()
-    sock = ctx.socket(zmq.REP)
-    sock.bind(f"tcp://*:{args.port}")
-    print(f"[pico-bridge] serving vive protocol on tcp://*:{args.port} "
-          f"(keyword '{args.keyword}', hand-side {tracked}). Waiting for PICO poses ...",
-          flush=True)
+    inspire = None
+    dump_pub = None
+    xrt_ready = False
+    try:
+        # Bind dump before xrt.init so a leftover 5558 fails fast without
+        # grabbing the XR SDK session.
+        if args.inspire_hands != "off" and args.inspire_dump_port:
+            dump_pub = InspireDumpPublisher(ctx=ctx, port=args.inspire_dump_port)
 
-    kw = args.keyword
-    last_log = 0.0
-    while True:
-        try:
-            _req = sock.recv_string()  # ViveStreamer request; content ignored
-        except KeyboardInterrupt:
-            break
-        out = {}
-        try:
-            head = xrt.get_headset_pose()
-            lc = xrt.get_left_controller_pose()
-            rc = xrt.get_right_controller_pose()
-            out[f"left_{kw}"] = _side_json(lc, head)
-            out[f"right_{kw}"] = _side_json(rc, head)
-            # Thumbstick axes for locomotion (ViveStreamer maps them to navigate_cmd;
-            # zeros when idle/disconnected -> zero velocity, safe failure mode)
-            out["left_joystick"] = [float(v) for v in xrt.get_left_axis()]
-            out["right_joystick"] = [float(v) for v in xrt.get_right_axis()]
-            now = time.monotonic()
-            if now - last_log > 1.0:
-                last_log = now
+        print("[pico-bridge] xrt.init() -- the PICO PC service must already be running "
+              "(~/start_xrsvc.sh) and the PICO app connected ...", flush=True)
+        xrt.init()
+        xrt_ready = True
 
-                def _fmt(side):
-                    d = out.get(f"{side}_{kw}")
-                    if not d:
-                        return "n/a"
-                    p = d["position"]; o = d["orientation"]
-                    e = R.from_quat([o["x"], o["y"], o["z"], o["w"]]).as_euler("xyz", degrees=True)
-                    return (f"pos({p['x']:+.2f},{p['y']:+.2f},{p['z']:+.2f}) "
-                            f"rpy({e[0]:+.0f},{e[1]:+.0f},{e[2]:+.0f})")
+        if args.inspire_hands != "off":
+            def _hand_inputs():
+                # (menu, left_trigger, right_trigger, left_grip, right_grip); untracked side forced open
+                lt = xrt.get_left_trigger() if "left" in tracked else 0.0
+                lg = xrt.get_left_grip() if "left" in tracked else 0.0
+                rt = xrt.get_right_trigger() if "right" in tracked else 0.0
+                rg = xrt.get_right_grip() if "right" in tracked else 0.0
+                return (False, lt, rt, lg, rg)
 
-                print(f"[pico-bridge] L {_fmt('left')} | R {_fmt('right')}", flush=True)
-        except Exception as e:
-            print(f"[pico-bridge] read error: {e}", flush=True)
-        sock.send_string(json.dumps(out))
+            inspire = InspireBridge(
+                get_inputs=_hand_inputs, mode="trigger", sides=tracked,
+                rate_hz=HANDS_RATE_HZ,
+                dump_publisher=dump_pub)
+            inspire.start()
 
-    if inspire is not None:
-        inspire.stop()
-    xrt.close()
+        sock = ctx.socket(zmq.REP)
+        sock.bind(f"tcp://*:{args.port}")
+        print(f"[pico-bridge] serving vive protocol on tcp://*:{args.port} "
+              f"(keyword '{args.keyword}', hand-side {tracked}). Waiting for PICO poses ...",
+              flush=True)
+        tap = None
+        if args.tap_port:
+            tap = ctx.socket(zmq.PUB)
+            tap.bind(f"tcp://127.0.0.1:{args.tap_port}")
+            print(f"[pico-bridge] observability tap PUB tcp://127.0.0.1:{args.tap_port}",
+                  flush=True)
+
+        kw = args.keyword
+        last_log = 0.0
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        while True:
+            try:
+                events = dict(poller.poll(20))
+            except KeyboardInterrupt:
+                break
+            out = {}
+            try:
+                head = xrt.get_headset_pose()
+                lc = xrt.get_left_controller_pose()
+                rc = xrt.get_right_controller_pose()
+                out[f"left_{kw}"] = _side_json(lc, head)
+                out[f"right_{kw}"] = _side_json(rc, head)
+                # Thumbstick axes for locomotion (ViveStreamer maps them to navigate_cmd;
+                # zeros when idle/disconnected -> zero velocity, safe failure mode)
+                out["left_joystick"] = [float(v) for v in xrt.get_left_axis()]
+                out["right_joystick"] = [float(v) for v in xrt.get_right_axis()]
+                now = time.monotonic()
+                if now - last_log > 1.0:
+                    last_log = now
+
+                    def _fmt(side):
+                        d = out.get(f"{side}_{kw}")
+                        if not d:
+                            return "n/a"
+                        p = d["position"]; o = d["orientation"]
+                        e = R.from_quat([o["x"], o["y"], o["z"], o["w"]]).as_euler("xyz", degrees=True)
+                        return (f"pos({p['x']:+.2f},{p['y']:+.2f},{p['z']:+.2f}) "
+                                f"rpy({e[0]:+.0f},{e[1]:+.0f},{e[2]:+.0f})")
+
+                    print(f"[pico-bridge] L {_fmt('left')} | R {_fmt('right')}", flush=True)
+            except Exception as e:
+                print(f"[pico-bridge] read error: {e}", flush=True)
+            payload = json.dumps(out)
+            if sock in events:
+                try:
+                    sock.recv_string()  # ViveStreamer request; content ignored
+                    sock.send_string(payload)
+                except KeyboardInterrupt:
+                    break
+            if tap is not None:
+                tap.send_string(payload)
+    finally:
+        if inspire is not None:
+            inspire.stop()
+        if dump_pub is not None:
+            dump_pub.close()
+        if xrt_ready:
+            xrt.close()
 
 
 if __name__ == "__main__":
