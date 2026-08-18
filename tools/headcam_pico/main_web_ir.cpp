@@ -635,6 +635,22 @@ void streamingThreadFunction() {
 
     GError *error = nullptr;
     GstElement *pipeline = gst_parse_launch(pipeline_str.c_str(), &error);
+    if (!pipeline || error) {
+      // Newer JetPacks (e.g. Thor R38) drop the maxperf-enable property from
+      // nvv4l2h264enc; retry without it so one binary runs on Orin and Thor.
+      if (error)
+        g_clear_error(&error);
+      error = nullptr;
+      std::string alt = pipeline_str;
+      size_t pos = alt.find("maxperf-enable=1 ");
+      if (pos != std::string::npos) {
+        alt.erase(pos, strlen("maxperf-enable=1 "));
+        std::cout << "Retrying pipeline without maxperf-enable" << std::endl;
+        if (pipeline)
+          gst_object_unref(pipeline);
+        pipeline = gst_parse_launch(alt.c_str(), &error);
+      }
+    }
     if (!pipeline) {
       std::cerr << "Failed to create pipeline: "
                 << (error ? error->message : "unknown") << std::endl;
