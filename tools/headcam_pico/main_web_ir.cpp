@@ -608,7 +608,11 @@ void streamingThreadFunction() {
       }
 
       pipeline_str =
-          "compositor name=comp background=black "
+          // latency + min-upstream-latency make the mixer LIVE: it emits on a
+          // deadline with whichever inputs arrived, so a stalled/silent branch
+          // (e.g. the udp: source) blanks its half instead of freezing both.
+          "compositor name=comp background=black latency=150000000 "
+          "min-upstream-latency=150000000 "
           "sink_0::xpos=" + std::to_string(x0) + " sink_0::ypos=" + std::to_string(y0) +
           " sink_0::width=" + std::to_string(w0) + " sink_0::height=" + std::to_string(h0) +
           " sink_1::xpos=" + std::to_string(x1) + " sink_1::ypos=" + std::to_string(y1) +
