@@ -27,7 +27,9 @@ BRIDGE_CMD='cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && p
 CAMERA_CMD='ssh g1 "cd ~/XRoboToolkit-Orin-Video-Sender && exec ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device /dev/v4l/by-id/usb-Intel_Intel_F450_00.00.01-video-index0 --pixfmt YUY2 --width 704 --height 1280 --fps 15 --zmq-pub 5555"'
 # Episode recorder (LeRobot format). Keys in the CONTROL-LOOP pane: c = start /
 # stop+save episode, x = discard. Dataset name/task via env: DATASET=, TASK=.
-EXPORTER_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 192.168.123.164 --camera-port 5555 --dataset-name '"${DATASET:-g1_teleop}"' --task-prompt "'"${TASK:-demo}"'" --no-add-stereo-camera --no-text-to-speech'
+# --data-collection copies g/v/b ratings into recorded/{good,neutral,bad}/.
+# --upload-bucket-path is the intended S3 bucket / upload prefix (DATASET_BUCKET).
+EXPORTER_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 192.168.123.164 --camera-port 5555 --dataset-name '"${DATASET:-g1_teleop}"' --task-prompt "'"${TASK:-demo}"'" --upload-bucket-path '"${DATASET_BUCKET:-darwin-robot-data}"' --no-add-stereo-camera --no-text-to-speech --data-collection'
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 
 case "${1:-up}" in

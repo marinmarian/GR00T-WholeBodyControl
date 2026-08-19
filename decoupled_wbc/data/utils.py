@@ -1,5 +1,9 @@
 from decoupled_wbc.control.robot_model.robot_model import RobotModel
 from decoupled_wbc.data.constants import RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH
+from gear_sonic.utils.teleop.inspire.inspire_dump import (
+    get_inspire_dataset_features,
+    get_inspire_modality_config,
+)
 
 
 def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False) -> dict:
@@ -70,6 +74,7 @@ def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False
         "video": {"ego_view": {"original_key": "observation.images.ego_view"}},
         "annotation": {"human.task_description": {"original_key": "task_index"}},
     }
+    modality_config.update(get_inspire_modality_config())
     if add_stereo_camera:
         modality_config["video"].update(
             {
@@ -153,4 +158,5 @@ def get_dataset_features(robot_model: RobotModel, add_stereo_camera: bool = Fals
             }
         )
 
+    dataset_features.update(get_inspire_dataset_features())
     return dataset_features

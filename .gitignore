@@ -67,7 +67,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
-data/
+docs/_build/
 
 # PyBuilder
 .pybuilder/
@@ -205,8 +205,14 @@ uv.lock
 xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
 *.code-workspace
-# Motion/training data (large local datasets, not tracked in git)
-data/
+# Motion/training data (large local datasets at repo root, not tracked in git)
+/data/
+# Python package decoupled_wbc/data/ is source (s3_util, save_layout, …).
+!decoupled_wbc/data/
+!decoupled_wbc/data/*.py
+!decoupled_wbc/data/s3_util.py
+!decoupled_wbc/data/save_layout.py
+!decoupled_wbc/data/exporter_prompts.py
 bones_seed_smpl/
 sonic_release/
 # Training output logs

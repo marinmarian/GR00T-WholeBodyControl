@@ -1,5 +1,6 @@
 from collections import deque
-from datetime import datetime
+from pathlib import Path
+import sys
 import threading
 import time
 
@@ -16,9 +17,21 @@ from decoupled_wbc.control.utils.keyboard_dispatcher import KeyboardListenerSubs
 from decoupled_wbc.control.utils.ros_utils import ROSMsgSubscriber, ROSServiceClient
 from decoupled_wbc.control.utils.telemetry import Telemetry
 from decoupled_wbc.control.utils.text_to_speech import TextToSpeech
-from decoupled_wbc.data.constants import BUCKET_BASE_PATH
 from decoupled_wbc.data.exporter import DataCollectionInfo, Gr00tDataExporter
+from decoupled_wbc.data.exporter_prompts import apply_exporter_prompts
+from decoupled_wbc.data.save_layout import EpisodeSavePaths, apply_episode_rating
 from decoupled_wbc.data.utils import get_dataset_features, get_modality_config
+from gear_sonic.utils.teleop.inspire.inspire_dump import (
+    InspireDumpSubscriber,
+    empty_inspire_snapshots,
+    inspire_frame_from_snapshots,
+)
+
+try:
+    from decoupled_wbc.data.s3_util import try_upload_episode_files as _try_upload_episode_files
+except ImportError:
+    # Container .venv_wbc may not have boto3 yet (host .venv_teleop does).
+    _try_upload_episode_files = None
 
 
 class TimeDeltaException(Exception):
@@ -81,13 +94,17 @@ class Gr00tDataCollector:
         state_topic_name: str,
         data_exporter: Gr00tDataExporter,
         text_to_speech=None,
-        frequency=20,
+        frequency=60,
         state_act_msg_frequency=50,
+        save_paths: EpisodeSavePaths | None = None,
+        inspire_dump_host: str = "127.0.0.1",
+        inspire_dump_port: int = 5558,
     ):
 
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.data_exporter = data_exporter
+        self.save_paths = save_paths
 
         self.node = node
 
@@ -124,12 +141,36 @@ class Gr00tDataCollector:
 
         self.telemetry = Telemetry(window_size=100)
         self.timing_threshold_monitor = TimingThresholdMonitor()
+        self._inspire_sub = None
+        if inspire_dump_port:
+            try:
+                self._inspire_sub = InspireDumpSubscriber(
+                    host=inspire_dump_host, port=inspire_dump_port
+                )
+            except Exception as e:
+                print(f"Inspire dump SUB failed (recording zeros): {e}", flush=True)
 
         print(f"Recording to {self.data_exporter.meta.root}")
 
     @property
     def current_episode_index(self):
         return self.data_exporter.episode_buffer["episode_index"]
+
+    def _maybe_upload_episode_tree(self, local_root: Path, quality: str | None = None) -> None:
+        if self.save_paths is None or not self.save_paths.data_collection:
+            return
+        if _try_upload_episode_files is None:
+            print(
+                "WARNING: boto3/s3_util not importable in this venv; "
+                "LeRobot episode stays local",
+                flush=True,
+            )
+            return
+        if quality is None:
+            prefix = f"raw/{self.save_paths.dataset_name}"
+        else:
+            prefix = f"recorded/{quality}/{self.save_paths.dataset_name}"
+        _try_upload_episode_files(local_root=local_root, s3_prefix=prefix)
 
     def _print_and_say(self, message: str, say: bool = True):
         """Helper to use TextToSpeech print_and_say or fallback to print."""
@@ -155,19 +196,28 @@ class Gr00tDataCollector:
                 self._print_and_say("Discarded episode")
         elif key in ("g", "v", "b"):
             # Rate the most recently saved episode: g = good, v = neutral, b = bad.
-            rating = {"g": "good", "v": "neutral", "b": "bad"}[key]
+            # Always annotates raw/.../meta/ratings.jsonl. Copies into recorded/
+            # only when data_collection is True. Discard (x) is never copied.
             if self._last_saved_index is None:
                 self._print_and_say("No saved episode to rate yet")
             else:
-                import json as _json
-
-                ratings_path = self.data_exporter.meta.root / "meta" / "ratings.jsonl"
-                with open(ratings_path, "a") as f:
-                    f.write(
-                        _json.dumps(
-                            {"episode_index": self._last_saved_index, "rating": rating}
-                        )
-                        + "\n"
+                save_paths = self.save_paths
+                if save_paths is None:
+                    exporter_root = Path(self.data_exporter.meta.root)
+                    save_paths = EpisodeSavePaths(
+                        root_output_dir=str(exporter_root.parent),
+                        dataset_name=exporter_root.name,
+                        save_layout="flat",
+                    )
+                rating = apply_episode_rating(
+                    paths=save_paths,
+                    raw_root=self.data_exporter.meta.root,
+                    episode_index=self._last_saved_index,
+                    rating_key=key,
+                )
+                if save_paths.data_collection:
+                    self._maybe_upload_episode_tree(
+                        save_paths.recorded_root(rating), quality=rating
                     )
                 self._print_and_say(f"Rated episode {self._last_saved_index}: {rating}")
 
@@ -213,6 +263,7 @@ class Gr00tDataCollector:
                     [self.latest_proprio_msg["base_height_command"]], dtype=np.float64
                 ),
             }
+            frame_data.update(self._inspire_frame_columns())
 
             # Add images based on dataset features
             images = self.latest_image_msg["images"]
@@ -242,12 +293,34 @@ class Gr00tDataCollector:
             else:
                 self._last_saved_index = self.data_exporter.episode_buffer["episode_index"]
                 self.data_exporter.save_episode()
+                self._maybe_upload_episode_tree(Path(self.data_exporter.meta.root))
                 self._print_and_say(
                     f"Finished saving episode {self._last_saved_index} - rate it: g=good v=neutral b=bad")
             self.timing_threshold_monitor.reset()
             self._episode_state.change_state()
 
         return True
+
+    def _inspire_frame_columns(self):
+        proprio_t = 0.0
+        if self.latest_proprio_msg is not None:
+            proprio_t = float(
+                self.latest_proprio_msg.get("timestamps", {}).get("proprio", 0.0) or 0.0
+            )
+        mech, tac = (None, None)
+        if self._inspire_sub is not None:
+            mech, tac = self._inspire_sub.get_latest()
+        now_unix = proprio_t if proprio_t else time.time()
+        now_mono = time.monotonic()
+        if mech is None:
+            mech, _ = empty_inspire_snapshots("right", now_unix, now_mono)
+        if tac is None:
+            _, tac = empty_inspire_snapshots(
+                mech.get("side", "right"),
+                mech.get("t_unix", now_unix),
+                mech.get("t_mono", now_mono),
+            )
+        return inspire_frame_from_snapshots(mech, tac, proprio_t)
 
     def save_and_cleanup(self):
         try:
@@ -256,12 +329,18 @@ class Gr00tDataCollector:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
                 self.data_exporter.save_episode()
+                self._maybe_upload_episode_tree(Path(self.data_exporter.meta.root))
             self._print_and_say(f"Recording complete: {self.data_exporter.meta.root}", say=False)
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}")
 
         self.node.destroy_node()
         rclpy.shutdown()
+        if self._inspire_sub is not None:
+            try:
+                self._inspire_sub.close()
+            except Exception:
+                pass
         self._print_and_say("Shutting down data exporter...", say=False)
 
     def run(self):
@@ -347,13 +426,20 @@ def main(config: DataExporterConfig):
     robot_config_client = ROSServiceClient(ROBOT_CONFIG_TOPIC)
     robot_config = robot_config_client.get_config()
 
+    save_paths = EpisodeSavePaths(
+        root_output_dir=config.root_output_dir,
+        dataset_name=config.dataset_name or "dataset",
+        save_layout=config.save_layout,
+        data_collection=config.data_collection,
+        bucket_base=config.upload_bucket_path,
+    )
     data_exporter = Gr00tDataExporter.create(
-        save_root=f"{config.root_output_dir}/{config.dataset_name}",
+        save_root=str(save_paths.capture_root()),
         fps=config.data_collection_frequency,
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        upload_bucket_path=BUCKET_BASE_PATH,
+        upload_bucket_path=save_paths.upload_bucket_path(),
         data_collection_info=data_collection_info,
         script_config=robot_config,
     )
@@ -366,39 +452,16 @@ def main(config: DataExporterConfig):
         camera_host=config.camera_host,
         camera_port=config.camera_port,
         text_to_speech=text_to_speech,
+        save_paths=save_paths,
+        inspire_dump_host=config.inspire_dump_host,
+        inspire_dump_port=config.inspire_dump_port,
     )
     data_collector.run()
 
 
 if __name__ == "__main__":
     config = tyro.cli(DataExporterConfig)
-    config.task_prompt = input("Enter the task prompt: ").strip().lower()
-    add_to_existing_dataset = input("Add to existing dataset? (y/n): ").strip().lower()
-
-    if add_to_existing_dataset == "y":
-        config.dataset_name = input("Enter the dataset name: ").strip().lower()
-        # When adding to existing dataset, we don't need robot_id or operator usernames
-        # as they should already be set in the existing dataset
-    elif add_to_existing_dataset == "n":
-        # robot_id = input("Enter the robot ID: ").strip().lower()
-        # if robot_id not in G1_ROBOT_IDS:
-        #     raise ValueError(f"Invalid robot ID: {robot_id}. Available robot IDs: {G1_ROBOT_IDS}")
-        config.robot_id = "sim"
-        config.dataset_name = f"{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}-G1-{config.robot_id}"
-
-        # Only ask for operator usernames when creating a new dataset
-        # print("Available teleoperator usernames:")
-        # for i, username in enumerate(OPERATOR_USERNAMES):
-        #     print(f"{i}: {username}")
-        # teleop_idx = int(input("Select teleoperator username index: "))
-        # config.teleoperator_username = OPERATOR_USERNAMES[teleop_idx]
-        config.teleoperator_username = "NEW_USER"
-
-        # print("\nAvailable support operator usernames:")
-        # for i, username in enumerate(OPERATOR_USERNAMES):
-        #     print(f"{i}: {username}")
-        # support_idx = int(input("Select support operator username index: "))
-        # config.support_operator_username = OPERATOR_USERNAMES[support_idx]
-        config.support_operator_username = "NEW_USER"
-
+    apply_exporter_prompts(
+        config, stdin_isatty=sys.stdin.isatty(), argv=sys.argv
+    )
     main(config)
