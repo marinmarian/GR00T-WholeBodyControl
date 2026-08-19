@@ -26,7 +26,10 @@ STREAMER_CMD='cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate &&
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
 DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
 CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! udpsink host=192.168.123.222 port=5600"'
-CAMTHOR_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_THOR' --pixfmt YUY2 --width 1280 --height 720 --fps 15 --second-device udp:5600 --second-width 640 --second-height 480'
+CAMTHOR_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_THOR' --pixfmt YUY2 --width 1280 --height 720 --fps 15 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555'
+# Episode recording (LeRobot + S3 when creds present). Type c/x/g/v/b in the KEYS pane.
+EXPORTER_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 127.0.0.1 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole body teleop}"'" --data-collection --no-add-stereo-camera --no-text-to-speech'
+KEYS_CMD='~/wbc-exec.sh python /workspace/wbc/tools/record_keys.py'
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 
 case "${1:-up}" in
@@ -79,6 +82,10 @@ up)
   tmux send-keys -t "$P_STR" "until pgrep -f RoboticsServiceProcess >/dev/null; do echo waiting for xr-service...; sleep 1; done; sleep 2; $STREAMER_CMD" C-m
   tmux send-keys -t "$P_DEP" "$DEPLOY_ENTER" C-m
   ( sleep 12; tmux send-keys -t "$P_DEP" "$DEPLOY_RUN" C-m ) &
+  P_EXP=$(tmux split-window -t "$P_STR" -v -P -F '#{pane_id}')
+  tmux send-keys -t "$P_EXP" "docker start wbc-dev >/dev/null 2>&1; sleep 3; $EXPORTER_CMD" C-m
+  P_KEY=$(tmux split-window -t "$P_DEP" -v -P -F '#{pane_id}')
+  tmux send-keys -t "$P_KEY" "docker start wbc-dev >/dev/null 2>&1; sleep 5; $KEYS_CMD" C-m
   tmux select-window -t $S:run
   tmux select-pane -t "$P_DEP"
 
@@ -90,6 +97,7 @@ up)
   echo "        Remote Vision -> 10.42.0.1 (color left, head-IR right)"
   echo "  DO NOT press A+B+X+Y while the streamer says 'waiting for body data'."
   echo "  Drive: calibration pose -> A+B+X+Y (stand) -> A+X (whole-body POSE)."
+  echo "  Record: type in the KEYS pane (bottom-right): c=start/stop+save x=discard g/v/b=rate."
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
 down)
@@ -101,8 +109,9 @@ down)
   pkill -f "pico_manage[r]_thread" 2>/dev/null
   pkill -f "OrinVideoSenderI[R]" 2>/dev/null
   pkill -f "g1_deploy_onnx_re[f]" 2>/dev/null
+  docker exec wbc-dev bash -c 'pkill -f "run_g1_data_exporte[r]"; pkill -f "record_key[s]"' 2>/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
-  echo "[ok] stopped session, streamer, deploy, cameras."
+  echo "[ok] stopped session, streamer, deploy, cameras, exporter."
   echo "     left running: xr-service (may be shared), igmp querier, hotspot."
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +124,7 @@ status)
   echo -n "deploy:         "; pgrep -f "g1_deploy_onnx_re[f]" >/dev/null && echo UP || echo down
   echo -n "cam thor D455f: "; lsusb 2>/dev/null | grep -qi 455f && echo -n "enumerated, " || echo -n "NOT ON USB, "; pgrep -f "OrinVideoSenderI[R]" >/dev/null && echo "sender UP" || echo "sender down"
   echo -n "cam g1 push:    "; ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pgrep -f "gst-launc[h]" >/dev/null' 2>/dev/null && echo UP || echo down
+  echo -n "data exporter:  "; docker exec wbc-dev pgrep -f run_g1_data_exporter >/dev/null 2>&1 && echo UP || echo down
   echo -n "robot lowlevel: "; ping -c1 -W1 192.168.123.161 >/dev/null 2>&1 && echo UP || echo DOWN
   echo -n "PICO on hotspot:"; ip neigh show dev wlP1p1s0 2>/dev/null | grep -q REACHABLE && echo " yes" || echo " not seen"
   ;;
