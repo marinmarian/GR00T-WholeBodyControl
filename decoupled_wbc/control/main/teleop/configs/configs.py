@@ -9,6 +9,7 @@ import decoupled_wbc
 from decoupled_wbc.control.main.config_template import ArgsConfig as ArgsConfigTemplate
 from decoupled_wbc.control.policy.wbc_policy_factory import WBC_VERSIONS
 from decoupled_wbc.control.utils.network_utils import resolve_interface
+from decoupled_wbc.data.constants import BUCKET_BASE_PATH
 
 
 def override_wbc_config(
@@ -174,8 +175,13 @@ class BaseConfig(ArgsConfigTemplate):
     data_collection: bool = True
     """Enable data collection"""
 
-    data_collection_frequency: int = 20
-    """Data collection frequency (Hz)"""
+    data_collection_frequency: int = 60
+    """Parquet / LeRobot info.json fps. Not a LeRobot library cap (was 20 in this
+    repo). 60 is the shared grid for body + Inspire hands. Body control_frequency
+    is 50 Hz so some proprio rows are latest-wins repeats. Head-cam stays
+    camera-native (~15 fps) and is repeated into this grid — do not treat video
+    as native 60 Hz.
+    """
 
     root_output_dir: str = "outputs"
     """Root output directory"""
@@ -268,7 +274,34 @@ class DataExporterConfig(BaseConfig, ComposedCameraClientConfig):
     dataset_name: Optional[str] = None
     """Name of the dataset to save the data to. If the dataset already exists,
     the new episodes will be appended to existing dataset. If the dataset does not exist,
-    episodes will be saved under root_output_dir/dataset_name.
+    episodes will be saved under the layout path (see save_layout).
+    """
+
+    save_layout: Literal["raw-recorded", "flat"] = "raw-recorded"
+    """Episode storage layout. 'raw-recorded' (default) writes every teleop capture
+    under {root_output_dir}/raw/{dataset_name}. 'flat' keeps the legacy
+    {root_output_dir}/{dataset_name} layout. This flag does not enable the
+    recorded/ tree; use data_collection / --data-collection for that.
+    """
+
+    data_collection: bool = False
+    """When True, rating keys g/v/b copy that episode into
+    {root_output_dir}/recorded/{good|neutral|bad}/{dataset_name}.
+    Default False: ratings still append to raw/.../meta/ratings.jsonl
+    but do not create recorded/. Discard (x) is never copied.
+    CLI: --data-collection / --no-data-collection.
+
+    Name collision: BaseConfig.data_collection defaults True (control-loop
+    recording enable). This exporter field is a different flag; nested
+    DataExporterConfig False must win for the exporter CLI. g1-vr does not
+    pass --data-collection (tmux stays non-interactive).
+    """
+
+    upload_bucket_path: str = os.environ.get("DATASET_BUCKET") or BUCKET_BASE_PATH
+    """Upload prefix / intended S3 bucket name. Defaults to DATASET_BUCKET from
+    the environment (g1-vr-teleop/config.env) or BUCKET_BASE_PATH. Raw vs
+    recorded suffixes are applied in EpisodeSavePaths when save_layout is
+    raw-recorded. Optional CLI: --upload-bucket-path.
     """
 
     task_prompt: str = "demo"
@@ -300,6 +333,12 @@ class DataExporterConfig(BaseConfig, ComposedCameraClientConfig):
 
     add_stereo_camera: bool = True
     """Whether to add stereo camera for data collection. If False, only use a signle ego view camera."""
+
+    inspire_dump_host: str = "127.0.0.1"
+    """Host of the Inspire dump PUB (pico_vive_bridge, port 5558). Container is host-networked."""
+
+    inspire_dump_port: int = 5558
+    """ZMQ port for Inspire mechanical + tactile topics. 0 disables the subscriber."""
 
 
 @dataclass
