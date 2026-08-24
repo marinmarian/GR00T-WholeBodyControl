@@ -331,6 +331,11 @@ class DataExporterConfig(BaseConfig, ComposedCameraClientConfig):
     text_to_speech: bool = True
     """Whether to use text-to-speech for voice feedback."""
 
+    add_head_camera: bool = False
+    """Record observation.images.head_view (second camera published by the
+    composite video sender, e.g. the D430i head IR). The camera message must
+    contain a 'head_view' image or the exporter will refuse frames."""
+
     add_stereo_camera: bool = True
     """Whether to add stereo camera for data collection. If False, only use a signle ego view camera."""
 

@@ -6,7 +6,7 @@ from gear_sonic.utils.teleop.inspire.inspire_dump import (
 )
 
 
-def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False) -> dict:
+def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False, add_head_camera: bool = False) -> dict:
     """
     Get the modality config for the robot model.
     """
@@ -75,6 +75,10 @@ def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False
         "annotation": {"human.task_description": {"original_key": "task_index"}},
     }
     modality_config.update(get_inspire_modality_config())
+    if add_head_camera:
+        modality_config["video"]["head_view"] = {
+            "original_key": "observation.images.head_view"
+        }
     if add_stereo_camera:
         modality_config["video"].update(
             {
@@ -86,7 +90,7 @@ def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False
     return modality_config
 
 
-def get_dataset_features(robot_model: RobotModel, add_stereo_camera: bool = False) -> dict:
+def get_dataset_features(robot_model: RobotModel, add_stereo_camera: bool = False, add_head_camera: bool = False) -> dict:
     """
     Get the dataset features for the robot model.
     """
@@ -96,6 +100,17 @@ def get_dataset_features(robot_model: RobotModel, add_stereo_camera: bool = Fals
             "shape": [RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH, 3],
             "names": ["height", "width", "channel"],
         },
+        **(
+            {
+                "observation.images.head_view": {
+                    "dtype": "video",
+                    "shape": [RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH, 3],
+                    "names": ["height", "width", "channel"],
+                }
+            }
+            if add_head_camera
+            else {}
+        ),
         "observation.state": {
             "dtype": "float64",
             "shape": (robot_model.num_joints,),

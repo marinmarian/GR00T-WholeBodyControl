@@ -287,7 +287,12 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
   return GST_FLOW_OK;
 }
 
-// msgpack for {"timestamps":{"ego_view":<f64>},"images":{"ego_view":<bin jpeg>}}
+// Latest head-camera JPEG (from the udp: branch), published alongside ego_view.
+std::mutex g_head_mutex;
+std::vector<uint8_t> g_head_jpeg;
+double g_head_ts = 0.0;
+
+// msgpack: {"timestamps":{name:<f64>...},"images":{name:<bin jpeg>...}}
 static void publish_data_frame(const uint8_t *jpeg, size_t len) {
   if (!g_zmq_pub)
     return;
@@ -295,32 +300,107 @@ static void publish_data_frame(const uint8_t *jpeg, size_t len) {
   gettimeofday(&tv, nullptr);
   double ts = tv.tv_sec + tv.tv_usec / 1e6;
 
+  std::vector<uint8_t> head;
+  double head_ts = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(g_head_mutex);
+    head = g_head_jpeg;
+    head_ts = g_head_ts;
+  }
+  int n_imgs = head.empty() ? 1 : 2;
+
   std::vector<uint8_t> m;
-  m.reserve(len + 64);
+  m.reserve(len + head.size() + 96);
   auto put_str = [&](const char *str) {
     size_t n = strlen(str);
     m.push_back(0xa0 | (uint8_t)n);  // fixstr (all our keys are < 32 chars)
     m.insert(m.end(), str, str + n);
   };
+  auto put_f64 = [&](double v) {
+    m.push_back(0xcb);
+    uint64_t bits;
+    memcpy(&bits, &v, 8);
+    for (int i = 7; i >= 0; --i)
+      m.push_back((bits >> (i * 8)) & 0xFF);
+  };
+  auto put_bin = [&](const uint8_t *d, size_t n) {
+    m.push_back(0xc6);  // bin32
+    m.push_back((n >> 24) & 0xFF);
+    m.push_back((n >> 16) & 0xFF);
+    m.push_back((n >> 8) & 0xFF);
+    m.push_back(n & 0xFF);
+    m.insert(m.end(), d, d + n);
+  };
   m.push_back(0x82);  // map(2)
   put_str("timestamps");
-  m.push_back(0x81);  // map(1)
+  m.push_back(0x80 | (uint8_t)n_imgs);
   put_str("ego_view");
-  m.push_back(0xcb);  // float64, big-endian
-  uint64_t bits;
-  memcpy(&bits, &ts, 8);
-  for (int i = 7; i >= 0; --i)
-    m.push_back((bits >> (i * 8)) & 0xFF);
+  put_f64(ts);
+  if (n_imgs == 2) {
+    put_str("head_view");
+    put_f64(head_ts);
+  }
   put_str("images");
-  m.push_back(0x81);  // map(1)
+  m.push_back(0x80 | (uint8_t)n_imgs);
   put_str("ego_view");
-  m.push_back(0xc6);  // bin32
-  m.push_back((len >> 24) & 0xFF);
-  m.push_back((len >> 16) & 0xFF);
-  m.push_back((len >> 8) & 0xFF);
-  m.push_back(len & 0xFF);
-  m.insert(m.end(), jpeg, jpeg + len);
+  put_bin(jpeg, len);
+  if (n_imgs == 2) {
+    put_str("head_view");
+    put_bin(head.data(), head.size());
+  }
   zmq_send(g_zmq_pub, m.data(), m.size(), ZMQ_DONTWAIT);
+}
+
+// Standalone head-recorder: consumes a SECOND copy of the RTP stream (the g1
+// push uses multiudpsink to port and port+1) so recording can never
+// backpressure the live video pipeline (an in-branch tee stalled it).
+GstElement *g_head_pipeline = nullptr;
+
+GstFlowReturn on_new_head_sample(GstAppSink *sink, gpointer user_data);
+
+static void start_head_recorder(int rtp_port) {
+  std::string desc =
+      "udpsrc port=" + std::to_string(rtp_port) +
+      " caps=application/x-rtp,media=video,encoding-name=JPEG,payload=26 ! "
+      "rtpjitterbuffer latency=80 ! rtpjpegdepay ! "
+      "appsink name=headsink emit-signals=true sync=false max-buffers=2 drop=true";
+  GError *err = nullptr;
+  g_head_pipeline = gst_parse_launch(desc.c_str(), &err);
+  if (!g_head_pipeline || err) {
+    std::cerr << "head recorder pipeline failed: "
+              << (err ? err->message : "unknown") << std::endl;
+    if (err)
+      g_clear_error(&err);
+    return;
+  }
+  GstElement *sink = gst_bin_get_by_name(GST_BIN(g_head_pipeline), "headsink");
+  g_signal_connect(sink, "new-sample", G_CALLBACK(on_new_head_sample), nullptr);
+  gst_object_unref(sink);
+  gst_element_set_state(g_head_pipeline, GST_STATE_PLAYING);
+  std::cout << "Head recorder listening on udp:" << rtp_port
+            << " (head_view in ZMQ frames)" << std::endl;
+}
+
+GstFlowReturn on_new_head_sample(GstAppSink *sink, gpointer user_data) {
+  (void)user_data;
+  GstSample *sample = gst_app_sink_pull_sample(sink);
+  if (!sample)
+    return GST_FLOW_ERROR;
+  GstBuffer *buffer = gst_sample_get_buffer(sample);
+  GstMapInfo map;
+  if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    std::lock_guard<std::mutex> lk(g_head_mutex);
+    if (g_head_jpeg.empty())
+      std::cout << "[head] first frame received (" << map.size << " bytes)"
+                << std::endl;
+    g_head_jpeg.assign(map.data, map.data + map.size);
+    g_head_ts = tv.tv_sec + tv.tv_usec / 1e6;
+    gst_buffer_unmap(buffer, &map);
+  }
+  gst_sample_unref(sample);
+  return GST_FLOW_OK;
 }
 
 GstFlowReturn on_new_data_sample(GstAppSink *sink, gpointer user_data) {
@@ -787,6 +867,8 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "Publishing ego_view JPEGs (composed-camera protocol) on " << ep
               << std::endl;
+    if (g_device2.rfind("udp:", 0) == 0)
+      start_head_recorder(std::stoi(g_device2.substr(4)) + 1);
   }
 
   std::cout << "Starting IR video streaming server (listen " << listen_address

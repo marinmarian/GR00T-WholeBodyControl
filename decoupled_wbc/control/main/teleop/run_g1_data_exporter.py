@@ -402,8 +402,8 @@ def main(config: DataExporterConfig):
         waist_location=waist_location, high_elbow_pose=config.high_elbow_pose
     )
 
-    dataset_features = get_dataset_features(g1_rm, config.add_stereo_camera)
-    modality_config = get_modality_config(g1_rm, config.add_stereo_camera)
+    dataset_features = get_dataset_features(g1_rm, config.add_stereo_camera, add_head_camera=config.add_head_camera)
+    modality_config = get_modality_config(g1_rm, config.add_stereo_camera, add_head_camera=config.add_head_camera)
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
