@@ -20,15 +20,17 @@
 #   * xr-service may be another user's (root) — this script never kills it.
 
 S=sonic
-CAM_THOR=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_455f_Intel_R__RealSense_TM__Depth_Camera_455f_254643069357-video-index0
+CAM_COLOR=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_455f_Intel_R__RealSense_TM__Depth_Camera_455f-video-index0
 CAM_G1=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_Intel_R__RealSense_TM__Depth_Camera_430i_349623061587-video-index2
 STREAMER_CMD='cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source xrt --inspire-hands trigger'
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
 DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
-CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"'
-CAMTHOR_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_THOR' --pixfmt YUY2 --width 1280 --height 720 --fps 15 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555'
+# Both cameras live on g1 now: the IR push loops on localhost (5600 video branch,
+# 5601 the head recorder) and the composite sender runs on g1 itself.
+CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=127.0.0.1:5600,127.0.0.1:5601"'
+CAMSEND_CMD='ssh g1 "cd ~/XRoboToolkit-Orin-Video-Sender && exec ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt YUY2 --width 1280 --height 720 --fps 15 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555"'
 # Episode recording (LeRobot + S3 when creds present). Type c/x/g/v/b in the KEYS pane.
-EXPORTER_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 127.0.0.1 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole body teleop}"'" --data-collection --no-add-stereo-camera --add-head-camera --no-text-to-speech'
+EXPORTER_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 192.168.123.164 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole body teleop}"'" --data-collection --no-add-stereo-camera --add-head-camera --no-text-to-speech'
 KEYS_CMD='~/wbc-exec.sh python /workspace/wbc/tools/record_keys.py'
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 
@@ -61,6 +63,7 @@ up)
   tmux kill-session -t $S 2>/dev/null
   pkill -f "pico_manage[r]_thread" 2>/dev/null
   pkill -f "OrinVideoSenderI[R]" 2>/dev/null
+  ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "OrinVideoSenderI[R]"' 2>/dev/null
   pkill -f "g1_deploy_onnx_re[f]" 2>/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
   sleep 1
@@ -72,7 +75,7 @@ up)
   P_CTH=$(tmux split-window -t "$P_XR" -v -P -F '#{pane_id}')
   tmux send-keys -t "$P_XR"  "$XRSVC_CMD" C-m
   tmux send-keys -t "$P_CG1" "until ping -c1 -W1 192.168.123.164 >/dev/null 2>&1; do echo waiting for g1...; sleep 3; done; $CAMG1_CMD" C-m
-  tmux send-keys -t "$P_CTH" "$CAMTHOR_CMD" C-m
+  tmux send-keys -t "$P_CTH" "until ping -c1 -W1 192.168.123.164 >/dev/null 2>&1; do echo waiting for g1...; sleep 3; done; $CAMSEND_CMD" C-m
   tmux select-layout -t $S:svc tiled
 
   # 5. run window: streamer | deploy
@@ -94,7 +97,7 @@ up)
   echo "  run window: LEFT = streamer, RIGHT = deploy ('O' = e-stop). Wait for 'Init Done'."
   echo "  svc window (Ctrl-b n): xr-service / cam-g1 / cam-thor"
   echo "  PICO: PC service 10.42.0.1 -> WORKING; Full body + Send + ankle trackers;"
-  echo "        Remote Vision -> 10.42.0.1 (color left, head-IR right)"
+  echo "        Remote Vision -> 192.168.123.164 (color left, head-IR right)"
   echo "  DO NOT press A+B+X+Y while the streamer says 'waiting for body data'."
   echo "  Drive: calibration pose -> A+B+X+Y (stand) -> A+X (whole-body POSE)."
   echo "  Record: type in the KEYS pane (bottom-right): c=start/stop+save x=discard g/v/b=rate."
@@ -108,6 +111,7 @@ down)
   tmux kill-session -t $S 2>/dev/null
   pkill -f "pico_manage[r]_thread" 2>/dev/null
   pkill -f "OrinVideoSenderI[R]" 2>/dev/null
+  ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "OrinVideoSenderI[R]"' 2>/dev/null
   pkill -f "g1_deploy_onnx_re[f]" 2>/dev/null
   docker exec wbc-dev bash -c 'pkill -f "run_g1_data_exporte[r]"; pkill -f "record_key[s]"' 2>/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
@@ -122,7 +126,7 @@ status)
   echo -n "xr-service:     "; pgrep -f RoboticsServiceProcess >/dev/null && echo UP || echo down
   echo -n "streamer:       "; pgrep -f "pico_manage[r]_thread" >/dev/null && echo UP || echo down
   echo -n "deploy:         "; pgrep -f "g1_deploy_onnx_re[f]" >/dev/null && echo UP || echo down
-  echo -n "cam thor D455f: "; lsusb 2>/dev/null | grep -qi 455f && echo -n "enumerated, " || echo -n "NOT ON USB, "; pgrep -f "OrinVideoSenderI[R]" >/dev/null && echo "sender UP" || echo "sender down"
+  echo -n "cam sender(g1): "; ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'lsusb 2>/dev/null | grep -qi 455f && pgrep -f "OrinVideoSenderI[R]" >/dev/null' 2>/dev/null && echo UP || echo down
   echo -n "cam g1 push:    "; ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pgrep -f "gst-launc[h]" >/dev/null' 2>/dev/null && echo UP || echo down
   echo -n "data exporter:  "; docker exec wbc-dev pgrep -f run_g1_data_exporter >/dev/null 2>&1 && echo UP || echo down
   echo -n "robot lowlevel: "; ping -c1 -W1 192.168.123.161 >/dev/null 2>&1 && echo UP || echo DOWN
