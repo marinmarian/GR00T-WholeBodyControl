@@ -220,7 +220,9 @@ std::unique_ptr<T> make_unique_helper(Args &&...args) {
 }
 
 bool initialize_sender() {
-  int retry = 10;
+  // The headset can take tens of seconds to arm its video listener after
+  // sending OPEN_CAMERA (seen after app restarts); keep knocking for 60 s.
+  int retry = 60;
   while (retry > 0 && !sender_ptr && !stop_requested.load()) {
     try {
       sender_ptr =
