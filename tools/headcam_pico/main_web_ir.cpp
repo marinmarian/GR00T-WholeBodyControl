@@ -180,6 +180,10 @@ std::condition_variable streaming_cv;
 std::mutex streaming_mutex;
 
 std::unique_ptr<TCPClient> sender_ptr;
+// Newer headset clients fire OPEN_CAMERA twice and appear to expect a video
+// connection per request; mirror packets onto an optional second connection.
+std::unique_ptr<TCPClient> sender2_ptr;
+std::mutex sender2_mutex;
 std::unique_ptr<TCPServer> server_ptr;
 std::string send_to_server = "";
 int send_to_port = 0;
@@ -274,6 +278,17 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
         packet[3] = (size) & 0xFF;
         std::copy(data, data + size, packet.begin() + 4);
         sender_ptr->sendData(packet);
+        {
+          std::lock_guard<std::mutex> lk(sender2_mutex);
+          if (sender2_ptr && sender2_ptr->isConnected()) {
+            try {
+              sender2_ptr->sendData(packet);
+            } catch (const TCPException &e2) {
+              std::cerr << "second stream dropped: " << e2.what() << std::endl;
+              sender2_ptr = nullptr;
+            }
+          }
+        }
       } catch (const TCPException &e) {
         std::cerr << "TCP error in on_new_sample: " << e.what() << std::endl;
         streaming_active.store(false);
@@ -503,6 +518,44 @@ void handle_sigint(int) {
   streaming_cv.notify_all();
 }
 
+// The 2026 XRoboToolkit client will not start rendering until it receives an
+// OPEN_CAMERA_ACK on the control connection carrying the audio/video session
+// config (schema g1_wuji_audio_ports_v2). Audio is disabled (ports 0); the
+// request id only needs to be a 16-128 char token.
+static void send_open_camera_ack() {
+  if (!server_ptr)
+    return;
+  std::string json =
+      "{\"schema\":\"g1_wuji_audio_ports_v2\","
+      "\"audio_request_id\":\"orinvideosender-0000-video-only-ack\","
+      "\"audio_stream_port\":0,"
+      "\"microphone_upload_port\":0,"
+      "\"video_projection\":\"flat\","
+      "\"video_stereo_layout\":\"mono\"}";
+  const std::string cmd = "OPEN_CAMERA_ACK";
+  std::vector<uint8_t> body;
+  auto put_le32 = [&](uint32_t v) {
+    body.push_back(v & 0xFF);
+    body.push_back((v >> 8) & 0xFF);
+    body.push_back((v >> 16) & 0xFF);
+    body.push_back((v >> 24) & 0xFF);
+  };
+  put_le32((uint32_t)cmd.size());
+  body.insert(body.end(), cmd.begin(), cmd.end());
+  put_le32((uint32_t)json.size());
+  body.insert(body.end(), json.begin(), json.end());
+  std::vector<uint8_t> frame;
+  frame.push_back((body.size() >> 24) & 0xFF);
+  frame.push_back((body.size() >> 16) & 0xFF);
+  frame.push_back((body.size() >> 8) & 0xFF);
+  frame.push_back(body.size() & 0xFF);
+  frame.insert(frame.end(), body.begin(), body.end());
+  if (server_ptr->replyToClient(frame))
+    std::cout << "Sent OPEN_CAMERA_ACK" << std::endl;
+  else
+    std::cerr << "Failed to send OPEN_CAMERA_ACK" << std::endl;
+}
+
 void handleOpenCamera(const std::vector<uint8_t> &data) {
   std::cout << "Handling OPEN_CAMERA command" << std::endl;
   try {
@@ -529,11 +582,33 @@ void handleOpenCamera(const std::vector<uint8_t> &data) {
     // the stream is healthy.
     if (streaming_active.load() && sender_ptr && sender_ptr->isConnected() &&
         cameraConfig.ip == send_to_server && cameraConfig.port == send_to_port) {
-      std::cout << "Duplicate OPEN_CAMERA for live stream - ignoring" << std::endl;
+      std::lock_guard<std::mutex> lk(sender2_mutex);
+      if (sender2_ptr && sender2_ptr->isConnected()) {
+        std::cout << "Duplicate OPEN_CAMERA - both streams already up" << std::endl;
+        send_open_camera_ack();
+        return;
+      }
+      std::cout << "Duplicate OPEN_CAMERA - trying a second video connection" << std::endl;
+      for (int i = 0; i < 5; ++i) {
+        try {
+          auto c = std::unique_ptr<TCPClient>(
+              new TCPClient(send_to_server, send_to_port));
+          c->connect();
+          sender2_ptr = std::move(c);
+          std::cout << "SECOND video connection ESTABLISHED - mirroring stream"
+                    << std::endl;
+          send_open_camera_ack();
+          return;
+        } catch (const TCPException &e) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        }
+      }
+      std::cout << "second connection refused - keeping single stream" << std::endl;
       return;
     }
     std::cout << "Updated sender target to " << send_to_server << ":"
               << send_to_port << std::endl;
+    send_open_camera_ack();
     startStreamingThread();
   } catch (const std::exception &e) {
     std::cerr << "Failed to parse camera config: " << e.what() << std::endl;
@@ -584,6 +659,12 @@ void stopStreamingThread() {
   if (sender_ptr && sender_ptr->isConnected())
     sender_ptr->disconnect();
   sender_ptr = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(sender2_mutex);
+    if (sender2_ptr && sender2_ptr->isConnected())
+      sender2_ptr->disconnect();
+    sender2_ptr = nullptr;
+  }
   if (streaming_thread && streaming_thread->joinable()) {
     streaming_cv.notify_all();
     streaming_thread->join();
