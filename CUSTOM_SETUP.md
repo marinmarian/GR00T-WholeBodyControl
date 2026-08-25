@@ -1,5 +1,8 @@
 # Custom Teleop Setup (marinmarian fork)
 
+**Day-to-day operations live in [RUNBOOK.md](RUNBOOK.md)** — quick start,
+per-component commands, and recovery for every failure we have hit.
+
 Notes and additions on top of upstream `NVlabs/GR00T-WholeBodyControl` for our G1 rig.
 Covers hardware/network layout, the Inspire-hand integration, the Meta Quest 3 (CloudXR)
 path, the PICO 4 (XRoboToolkit) path, and the decoupled_wbc IK pipeline. Everything here
