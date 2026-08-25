@@ -523,6 +523,15 @@ void handleOpenCamera(const std::vector<uint8_t> &data) {
     send_to_port = cameraConfig.port;
     if (!g_video_via.empty())
       std::cout << "Video routed via relay " << g_video_via << std::endl;
+    // Newer XRoboToolkit clients fire OPEN_CAMERA twice per panel-open; the
+    // second accept is refused by the headset, so restarting the live stream
+    // for a duplicate kills a working session. Ignore exact duplicates while
+    // the stream is healthy.
+    if (streaming_active.load() && sender_ptr && sender_ptr->isConnected() &&
+        cameraConfig.ip == send_to_server && cameraConfig.port == send_to_port) {
+      std::cout << "Duplicate OPEN_CAMERA for live stream - ignoring" << std::endl;
+      return;
+    }
     std::cout << "Updated sender target to " << send_to_server << ":"
               << send_to_port << std::endl;
     startStreamingThread();
