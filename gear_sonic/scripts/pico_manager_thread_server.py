@@ -25,6 +25,7 @@
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -612,6 +613,65 @@ def init_hand_ik_solvers():
 # Tuple form keeps the dispatch sites uniform if/when a second reader speaks
 # the same schema.
 _ISAAC_TELEOP_READERS = (input_readers.IsaacTeleopReader,)
+
+
+class EpisodeKeyController:
+    """Maps PICO gestures to exporter episode keys, sent as UDP datagrams to
+    the record_keys.py bridge (which republishes them on /Gr00tKeyboardListener).
+
+    Right thumbstick click: tap = 'c' (start / stop+save), hold >= 1.5 s = 'x'
+    (discard). Fallback for clients that don't forward stick clicks: A+Y with
+    B and X released, held 0.25 s = 'c' (the confirm delay keeps an e-stop
+    mash that passes through A+Y from toggling recording).
+    """
+
+    HOLD_DISCARD_S = 1.5
+    AY_CONFIRM_S = 0.25
+
+    def __init__(self, host="127.0.0.1", port=5559):
+        self.addr = (host, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.prev_click = False
+        self.click_t0 = 0.0
+        self.click_consumed = False
+        self.ay_t0 = None
+        self.ay_fired = False
+
+    def _send(self, key):
+        try:
+            self.sock.sendto(key.encode(), self.addr)
+            print(f"[EpisodeKeys] '{key}' -> udp://{self.addr[0]}:{self.addr[1]}")
+        except OSError as e:
+            print(f"[EpisodeKeys] send failed: {e}")
+
+    def update(self, right_axis_click, a_pressed, b_pressed, x_pressed, y_pressed):
+        now = time.monotonic()
+
+        # Right stick click: 'c' on release of a tap; 'x' fires while held.
+        if right_axis_click and not self.prev_click:
+            self.click_t0 = now
+            self.click_consumed = False
+        if (
+            right_axis_click
+            and not self.click_consumed
+            and now - self.click_t0 >= self.HOLD_DISCARD_S
+        ):
+            self._send("x")
+            self.click_consumed = True
+        if not right_axis_click and self.prev_click and not self.click_consumed:
+            self._send("c")
+        self.prev_click = right_axis_click
+
+        ay = a_pressed and y_pressed and not b_pressed and not x_pressed
+        if ay:
+            if self.ay_t0 is None:
+                self.ay_t0 = now
+            elif not self.ay_fired and now - self.ay_t0 >= self.AY_CONFIRM_S:
+                self._send("c")
+                self.ay_fired = True
+        else:
+            self.ay_t0 = None
+            self.ay_fired = False
 
 
 def get_controller_inputs(reader=None):
@@ -2075,6 +2135,11 @@ def run_pico_manager(
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(
+        "Recording: right-stick click tap=c (start/stop+save), "
+        "hold 1.5s=x (discard); A+Y held=c"
+    )
+    episode_keys = EpisodeKeyController()
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -2092,7 +2157,10 @@ def run_pico_manager(
 
             left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
 
-            left_axis_click, _ = get_axis_clicks(reader)
+            left_axis_click, right_axis_click = get_axis_clicks(reader)
+            episode_keys.update(
+                right_axis_click, a_pressed, b_pressed, x_pressed, y_pressed
+            )
             # Quest WebXR client never forwards thumbstick clicks (verified) —
             # accept B+X (with A and Y released) as the VR_3PT toggle instead.
             left_axis_click = left_axis_click or (

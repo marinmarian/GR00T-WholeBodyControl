@@ -57,9 +57,12 @@ tmux attach -t sonic
   (4+ are squat/kneel/lying/boxing/jump stunts that fight the hoist).
 - Stop: `O` in deploy pane / `A+B+X+Y` / `L2+B` damp.
 
-### Recording (typed in the KEYS pane)
+### Recording (KEYS pane or PICO controller)
 - `c` start episode → `c` again stop & save → `g`/`v`/`b` rate good/neutral/bad
 - `x` = discard while recording
+- Controller (streamer maps gestures → UDP 5559 → the KEYS-pane bridge, so that
+  pane must be running): **right-stick click** tap = `c`, hold ≥1.5 s = `x`;
+  fallback **A+Y** held ¼ s = `c`. Ratings stay on the keyboard.
 - Episodes: `~/GR00T-WholeBodyControl/outputs/<dataset>/` (LeRobot format:
   parquet + `ego_view` + `head_view` videos). Ratings sort copies into
   `recorded/{good,neutral,bad}/` and upload to `s3://darwin-robot-data/`
@@ -149,6 +152,7 @@ docker start wbc-dev
   --add-head-camera --no-text-to-speech
 # separate terminal — recording keys need their own publisher in the SONIC stack:
 ~/wbc-exec.sh python /workspace/wbc/tools/record_keys.py
+# (also bridges the PICO recording gestures: listens on udp://127.0.0.1:5559)
 ```
 
 ### IK stack (right-arm / decoupled) — different workflow entirely
@@ -185,6 +189,12 @@ After any hotspot/NM restart the PICO must rejoin the WiFi and reconnect the app
    as camera source (the headset drops everything else). This is why the sender
    lives on mjolnir and Remote Vision points at `10.42.0.1`. Do not relay or
    route the video from another host.
+6. Feeds connect but never render (2026 app versions): the client waits for an
+   `OPEN_CAMERA_ACK` reply on the control connection before showing video, and
+   double-fires `OPEN_CAMERA` (a second video connection gets mirrored). The
+   sender handles both since commit `a170c63` — look for `Sent OPEN_CAMERA_ACK`
+   in its pane; if missing, rebuild `OrinVideoSenderIR` from
+   `tools/headcam_pico/`. This was the root cause of the Aug 24–25 outage.
 
 **Camera present but pipeline dead / won't preroll** — RealSense firmware wedge
 after a USB drop: unplug the camera, count to 10, replug. (The D455f's USB-C
@@ -192,6 +202,14 @@ cable drops often — replace it someday.) Check enumeration: `lsusb | grep -i 4
 
 **Right half of composite black** — the g1 IR push died (it stalls silently
 sometimes). Restart the push; the color half keeps playing by design.
+
+**Recording keys do nothing** — the KEYS-pane bridge (`record_keys.py`) must be
+running (before 2026-08-28 it crashed on startup with an `IndexError` from
+`keyboard_dispatcher` — pull if you see that). A working `c` prints
+`Started recording N` in the exporter pane. If typing works but the controller
+doesn't: check the streamer pane for `[EpisodeKeys]` lines (gestures are
+detected there) — present there but not in KEYS means the UDP hop
+(127.0.0.1:5559) is broken, i.e. the processes aren't on the same host.
 
 **Deploy dies: `LowState or IMUState is not available`** — querier is down
 (reboot kills it). Start it, rerun the deploy.

@@ -29,7 +29,8 @@ DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model
 # 5601 the head recorder) and the composite sender runs on g1 itself.
 CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"'
 CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt YUY2 --width 1280 --height 720 --fps 15 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555'
-# Episode recording (LeRobot + S3 when creds present). Type c/x/g/v/b in the KEYS pane.
+# Episode recording (LeRobot + S3 when creds present). Keys c/x/g/v/b in the KEYS
+# pane, or PICO gestures (right-stick click / A+Y) relayed over UDP 5559.
 EXPORTER_CMD='~/wbc-marin-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 127.0.0.1 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole_body_teleop}"'" --data-collection --no-add-stereo-camera --add-head-camera --no-text-to-speech'
 KEYS_CMD='~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys.py'
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
@@ -101,6 +102,7 @@ up)
   echo "  DO NOT press A+B+X+Y while the streamer says 'waiting for body data'."
   echo "  Drive: calibration pose -> A+B+X+Y (stand) -> A+X (whole-body POSE)."
   echo "  Record: type in the KEYS pane (bottom-right): c=start/stop+save x=discard g/v/b=rate."
+  echo "          or PICO: right-stick click tap=start/stop+save, hold 1.5s=discard; A+Y held=start/stop. Rate g/v/b on keyboard."
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
 down)
