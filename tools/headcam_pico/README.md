@@ -55,13 +55,21 @@ if asked). The picture appears as a 2D screen; controller **B** toggles 2D <-> s
   1-byte-length-prefixed strings (camera type, **callback ip**).
 - Sender opens a TCP connection back to that ip:port and streams frames as
   `[4B BE len][H.264 NAL]`.
+- On every `OPEN_CAMERA` the sender also replies on the control connection with
+  `[4B BE bodyLen][4B LE cmdLen]["OPEN_CAMERA_ACK"][4B LE dataLen][JSON]` (schema
+  `g1_wuji_audio_ports_v2`, audio ports 0, `video_projection: "flat"`,
+  `video_stereo_layout: "mono"`). **2026 app versions do not render without this
+  ACK.** The client also re-fires `OPEN_CAMERA` (ignored while the stream is live)
+  and may open a second video connection (mirrored, not restarted).
 - The 640x480 IR is `nvvidconv`-scaled to the width/height the headset requested.
 
 ## Notes / TODO
 
-- Observed live: PICO requested 2160x810 @ 60, ~20 Mbps, type "VR". The mono IR upscaled
-  to that stereo canvas looks **stretched** and both eyes see the same image. To improve:
-  letterbox to keep 4:3, or emit a proper side-by-side (mono duplicated into L/R halves).
+- Observed live: PICO requested 2160x810 @ 60, ~20 Mbps, type "VR". Letterboxing to the
+  requested canvas is now built in (`--fit`), and the sender has since grown
+  `--second-device` compositing, `--zmq-pub` recording frames, `--flip`, `--max-bitrate`,
+  and the ACK/duplicate handling above — the CLI flags at the top of `main_web_ir.cpp`
+  and `RUNBOOK.md` are the current reference.
 - Networking: if the PICO is on the wired 192.168.123.0/24 LAN (same subnet as the robot
   PC) it connects directly. If it is on mjolnir's 10.42.0.x hotspot, add on the robot PC
   `sudo ip route add 10.42.0.0/24 via 192.168.123.222` and `FORWARD` ACCEPT on mjolnir.

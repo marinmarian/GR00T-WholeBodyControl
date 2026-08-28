@@ -46,7 +46,9 @@ is specific to our machine **mjolnir** (Jetson AGX Thor backpack) driving a Unit
   ```
   PICO joins `mjolnir-xr` (it will warn "no internet" — keep the connection; add the
   MASQUERADE rule above only if headset internet is wanted). In the app: **PC service =
-  `10.42.0.1`** (not .222), Remote Vision stays `192.168.123.164`.
+  `10.42.0.1`** (not .222), **Remote Vision = `10.42.0.1`** too — the camera
+  sender moved to mjolnir 2026-08 (it was `192.168.123.164` while the sender ran on g1;
+  current camera layout and commands live in `RUNBOOK.md`).
 
   **Camera-video gotchas learned the hard way:** (1) the g1 route above is what makes the
   camera stream reach the headset — persist it (`sudo nmcli con mod unitree1 +ipv4.routes
@@ -194,11 +196,15 @@ third-party `XR-Robotics/XRoboToolkit-Orin-Video-Sender`, ported from its
 camera type), `run_headcam_sender.sh` (launch helper), and a README with full
 build / run / protocol details.
 
-Run on the robot PC: `./run_headcam_sender.sh` (listens on `0.0.0.0:13579`); in the PICO
-set Remote Vision **camera source IP = <robot PC IP>**. The headset connects, sends
-`OPEN_CAMERA` with its callback ip:port, and the sender streams H.264 back. Runs alongside
-teleop. Known rough edge: the mono IR is upscaled to the headset's stereo canvas so it
-looks stretched -- letterbox or a proper side-by-side split is a TODO.
+**Current layout (2026-08): the sender runs on mjolnir**, composites the D455f color
+feed (left) with the g1 head-IR RTP push (right), and Remote Vision points at
+`10.42.0.1` — full commands in `RUNBOOK.md`. The headset connects, sends `OPEN_CAMERA`
+with its callback ip:port; the sender replies with `OPEN_CAMERA_ACK` (required by 2026
+app versions — without it the client never renders) and streams H.264 back. Runs
+alongside teleop. Letterboxing is built in (`--fit`), and the sender absorbs the
+client's duplicate `OPEN_CAMERA` / second video connection. NOTE: the sender binary
+built on g1 predates the ACK fix — rebuild from `tools/headcam_pico/` before any
+sender-on-g1 layout.
 
 ---
 
@@ -231,7 +237,7 @@ bridge; control loop -> teleop loop), `down` stops it, `status` health-checks. W
 `svc` = xr-service / head-cam / bridge, `run` = control + teleop loops (activation keys
 `]` `l` `o` go in the left pane). The IGMP querier stays manual (`sudo python3
 ~/igmp_querier.py`, foreground) and the PICO app steps stay manual (PC service = mjolnir IP,
-Remote Vision = robot-PC IP).
+Remote Vision = the sender host's IP — mjolnir since 2026-08, see `RUNBOOK.md`).
 
 Known trip: a fast right-arm motion (or the engage snap) can exceed the 8 rad/s arm
 velocity limit -> safe mode latches -> `docker restart wbc-dev`, rerun. Move gently for the

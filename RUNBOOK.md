@@ -17,7 +17,7 @@ hotspot AP `10.42.0.1`), **g1** = robot's onboard Orin Nano
 | deploy (`g1_deploy_onnx_ref`) | mjolnir, `g1-deploy-dev` container | SONIC policy → robot; `O` = e-stop |
 | camera sender (`OrinVideoSenderIR`) | mjolnir | D455f color + composite → headset + recording tee |
 | head-IR push (gst-launch) | g1 | D430i IR → mjolnir via RTP (5600 video / 5601 recorder) |
-| episode exporter + keys | mjolnir, `wbc-dev` container | LeRobot datasets + S3 upload |
+| episode exporter + keys | mjolnir, `wbc-marin` container | LeRobot datasets + S3 upload |
 
 Cameras: **D455f (color) on mjolnir USB**, **D430i (head IR) on g1**.
 PICO enters exactly two addresses: **PC service `10.42.0.1`**, **Remote Vision `10.42.0.1`**.
@@ -63,11 +63,12 @@ tmux attach -t sonic
 - Controller (streamer maps gestures → UDP 5559 → the KEYS-pane bridge, so that
   pane must be running): **right-stick click** tap = `c`, hold ≥1.5 s = `x`;
   fallback **A+Y** held ¼ s = `c`. Ratings stay on the keyboard.
-- Episodes: `~/GR00T-WholeBodyControl/outputs/<dataset>/` (LeRobot format:
+- Episodes: `~/GR00T-WholeBodyControl/outputs/raw/<dataset>/` (LeRobot format:
   parquet + `ego_view` + `head_view` videos). Ratings sort copies into
-  `recorded/{good,neutral,bad}/` and upload to `s3://darwin-robot-data/`
-  (region eu-central-1; creds in `~/.aws` + inside wbc-dev). Upload failures
-  warn and keep everything local — nothing is lost.
+  `outputs/recorded/{good,neutral,bad}/<dataset>/` and upload to
+  `s3://darwin-robot-data/` (region eu-central-1; creds in `~/.aws`,
+  bind-mounted into wbc-marin). Upload failures warn and keep everything
+  local — nothing is lost.
 - Keep Remote Vision open while recording: camera frames only flow during a
   live headset video session.
 
@@ -143,15 +144,15 @@ gst-launch-1.0 v4l2src device=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Ca
 ```
 5600 feeds the headset composite; 5601 feeds the dataset's `head_view` column.
 
-### Episode exporter + recording keys (mjolnir, wbc-dev container)
+### Episode exporter + recording keys (mjolnir, wbc-marin container)
 ```bash
-docker start wbc-dev
-~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py \
+docker start wbc-marin
+~/wbc-marin-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py \
   --camera-host 127.0.0.1 --camera-port 5555 --dataset-name my_dataset \
   --task-prompt "describe the task" --data-collection --no-add-stereo-camera \
   --add-head-camera --no-text-to-speech
 # separate terminal — recording keys need their own publisher in the SONIC stack:
-~/wbc-exec.sh python /workspace/wbc/tools/record_keys.py
+~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys.py
 # (also bridges the PICO recording gestures: listens on udp://127.0.0.1:5559)
 ```
 
@@ -195,6 +196,8 @@ After any hotspot/NM restart the PICO must rejoin the WiFi and reconnect the app
    sender handles both since commit `a170c63` — look for `Sent OPEN_CAMERA_ACK`
    in its pane; if missing, rebuild `OrinVideoSenderIR` from
    `tools/headcam_pico/`. This was the root cause of the Aug 24–25 outage.
+   (The sender copy built on g1 is still pre-ACK — rebuild it before ever
+   running the sender on g1 again.)
 
 **Camera present but pipeline dead / won't preroll** — RealSense firmware wedge
 after a USB drop: unplug the camera, count to 10, replug. (The D455f's USB-C
@@ -241,7 +244,7 @@ and commit working-tree changes promptly: uncommitted edits have vanished here.
 
 **AWS/S3** — bucket `darwin-robot-data` (eu-central-1), IAM user
 `robotics-developer`, creds in `~/.aws/credentials` (profiles `default` +
-`darwin`) and copied into `wbc-dev:/root/.aws/`. Test:
+`darwin`) and bind-mounted into `wbc-marin:/root/.aws`. Test:
 `aws s3 ls s3://darwin-robot-data/raw/ --profile darwin` (or the boto3
 one-liner in CUSTOM_SETUP.md). `InvalidAccessKeyId` = key
 deactivated/rotated — ask the account owner.
