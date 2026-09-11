@@ -23,17 +23,27 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import json
+from pathlib import Path
+import threading
 import time
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import tyro
+
 import zmq
+
+try:
+    from decoupled_wbc.data.s3_util import try_upload_episode_files
+except Exception:  # noqa: BLE001 - boto3 may be absent; recording must still work
+    try_upload_episode_files = None
 
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
     get_features_sonic_vla,
     get_g1_robot_model,
+    get_head_camera_features,
+    get_head_camera_modality_config,
     get_modality_config_sonic_vla,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
@@ -47,6 +57,15 @@ from gear_sonic.utils.data_collection.transforms import compute_projected_gravit
 from gear_sonic.utils.data_collection.zmq_state_subscriber import (
     ZMQStateSubscriber,
     poll_robot_config_zmq,
+)
+from gear_sonic.utils.teleop.inspire.inspire_dump import (
+    INSPIRE_DUMP_HOST,
+    INSPIRE_DUMP_PORT,
+    InspireHandStateSubscriber,
+    inspire_actual_to_g1_hand_q,
+)
+from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
+    G1GripperInverseKinematicsSolver,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,12 +112,33 @@ class SonicDataExporterConfig:
     state_zmq_port: int = 5557
     """ZMQ port for robot state (same socket as robot_config topic)."""
 
+    # ZMQ: Inspire hand state (from the InspireBridge inside pico_manager_thread_server)
+    inspire_dump_host: str = INSPIRE_DUMP_HOST
+    """ZMQ host of the Inspire hand dump publisher."""
+
+    inspire_dump_port: int = INSPIRE_DUMP_PORT
+    """ZMQ port of the Inspire hand dump publisher. 0 disables and falls back to the
+    C++ deploy's hand_q (all zeros unless Dex3 hands are attached)."""
+
+    inspire_state_max_age: float = 0.25
+    """Seconds after which an Inspire hand snapshot is considered stale and the
+    frame falls back to the C++ hand_q."""
+
     # Robot config
     robot_config_timeout: float = 0
     """Seconds to wait for the ZMQ robot_config message at startup (0 = wait forever)."""
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+
+    add_head_camera: bool = False
+    """Record the head IR camera as observation.images.head_view. The sender already
+    publishes `head_view` in every camera message; without this it is dropped."""
+
+    upload_bucket_path: str | None = None
+    """S3 bucket to upload each saved episode to (e.g. darwin-robot-data). Unset =
+    keep everything local. Uploads run on a background thread under the prefix
+    raw/<dataset-name>/ and never block or fail recording."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -227,9 +267,17 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        upload_bucket_path: str | None = None,
+        dataset_name: str = "",
+        inspire_dump_host: str = INSPIRE_DUMP_HOST,
+        inspire_dump_port: int = INSPIRE_DUMP_PORT,
+        inspire_state_max_age: float = 0.25,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
+        self.upload_bucket_path = upload_bucket_path
+        self.dataset_name = dataset_name
+        self._upload_threads: list[threading.Thread] = []
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
@@ -282,11 +330,172 @@ class GrootDataCollector:
         self._last_latency_log_time = 0.0
         self._initial_yaw = None
 
+        # Real hand state from the Inspire bridge (dump port). The C++ deploy's
+        # hand_q is Dex3-only and streams zeros with Inspire hands attached.
+        self._inspire_sub = None
+        self._inspire_state_max_age = float(inspire_state_max_age)
+        self._inspire_frames_used = 0
+        self._inspire_frames_fallback = 0
+        self._inspire_last_warn = 0.0
+        self._hand_open_q = {}
+        self._hand_closed_q = {}
+        self._hand_thumb_slots = {}
+        self._hand_finger_slots = {}
+        if inspire_dump_port:
+            try:
+                self._inspire_sub = InspireHandStateSubscriber(
+                    host=inspire_dump_host, port=inspire_dump_port
+                )
+            except Exception as e:  # noqa: BLE001 - recording must still work
+                print(f"[Inspire] hand-state SUB failed (recording C++ hand_q): {e}", flush=True)
+            # Same solver + fingertip layout the streamer uses for
+            # teleop.*_hand_joints, so state and action share one hand space.
+            for side in ("left", "right"):
+                solver = G1GripperInverseKinematicsSolver(side=side)
+                fingertips = np.zeros([25, 4, 4])
+                fingertips[4, 0, 3] = 1.0  # thumb tip (generate_finger_data)
+                self._hand_open_q[side] = np.asarray(
+                    solver({"position": fingertips}), dtype=np.float64
+                ).reshape(-1)
+                fingertips[14, 0, 3] = 1.0  # middle tip -> closed grip
+                self._hand_closed_q[side] = np.asarray(
+                    solver({"position": fingertips}), dtype=np.float64
+                ).reshape(-1)
+                # Which slots of the 7-vector are thumb vs index/middle joints,
+                # read from the robot model so a joint-order change cannot
+                # silently swap them (actuated order is thumb-first, state
+                # column order is index/middle-first).
+                hand_idx = list(self.robot_model.get_hand_actuated_joint_indices(side))
+                slot_names = [self.robot_model.joint_names[i] for i in hand_idx]
+                self._hand_thumb_slots[side] = tuple(
+                    k for k, nm in enumerate(slot_names) if "thumb" in nm
+                )
+                self._hand_finger_slots[side] = tuple(
+                    k for k, nm in enumerate(slot_names) if "thumb" not in nm
+                )
+                assert len(self._hand_thumb_slots[side]) == 3, slot_names
+                assert len(self._hand_finger_slots[side]) == 4, slot_names
+
         print(f"Recording to {self.data_exporter.meta.root}")
+
+    def _hand_q_from_inspire(self, side: str, fallback: np.ndarray) -> np.ndarray:
+        """7-DoF hand joint state for ``side``: Inspire measurement, else ``fallback``."""
+        if self._inspire_sub is None:
+            return fallback
+        actual, age = self._inspire_sub.get_actual(side, max_age_s=self._inspire_state_max_age)
+        if actual is None:
+            self._inspire_frames_fallback += 1
+            now = time.time()
+            if now - self._inspire_last_warn >= 5.0:
+                self._inspire_last_warn = now
+                why = "no snapshot yet" if age is None else f"stale ({age * 1000:.0f} ms)"
+                print(
+                    f"[Inspire] {side} hand state unavailable ({why}); "
+                    f"recording C++ hand_q for this frame",
+                    flush=True,
+                )
+            return fallback
+        self._inspire_frames_used += 1
+        return inspire_actual_to_g1_hand_q(
+            actual,
+            self._hand_open_q[side],
+            self._hand_closed_q[side],
+            thumb_slots=self._hand_thumb_slots[side],
+            finger_slots=self._hand_finger_slots[side],
+        )
+        if self.upload_bucket_path:
+            if try_upload_episode_files is None:
+                print(
+                    "[S3] WARNING: boto3/s3_util not importable in this venv - "
+                    "episodes stay local",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[S3] each saved episode -> "
+                    f"s3://{self.upload_bucket_path}/raw/{self.dataset_name}/",
+                    flush=True,
+                )
 
     @property
     def current_episode_index(self):
         return self.data_exporter.episode_buffer["episode_index"]
+
+    def _upload_episode(self, episode_index: int) -> None:
+        """Upload one saved episode (parquet + videos + meta) to S3 in the background.
+
+        The local files stay put and are the source of truth; a failed upload
+        warns and is otherwise ignored, so recording never depends on the network.
+        """
+        if not self.upload_bucket_path or try_upload_episode_files is None:
+            return
+
+        root = Path(self.data_exporter.meta.root)
+        prefix = f"raw/{self.dataset_name}" if self.dataset_name else "raw"
+
+        def _run():
+            try:
+                results = try_upload_episode_files(
+                    local_root=root,
+                    s3_prefix=prefix,
+                    bucket=self.upload_bucket_path,
+                    include_videos=True,
+                    only_episode=episode_index,
+                )
+            except Exception as exc:  # noqa: BLE001 - never kill the session
+                print(f"[S3] episode {episode_index} upload failed: {exc}", flush=True)
+                return
+            ok = sum(1 for r in results if r.uploaded)
+            print(
+                f"[S3] episode {episode_index}: {ok}/{len(results)} files -> "
+                f"s3://{self.upload_bucket_path}/{prefix}/",
+                flush=True,
+            )
+
+        thread = threading.Thread(
+            target=_run, name=f"s3-upload-ep{episode_index}", daemon=True
+        )
+        self._upload_threads.append(thread)
+        thread.start()
+
+    def _finish_uploads(self, timeout_s: float = 300.0) -> None:
+        """Wait for in-flight episode uploads before the process exits.
+
+        The upload threads are daemons, so without this they are killed the
+        moment the process ends and a large episode still in flight is simply
+        lost from S3 (the local files are unaffected). Bounded so Ctrl-C still
+        exits, and it names the resync command for whatever did not finish.
+        """
+        pending = [t for t in self._upload_threads if t.is_alive()]
+        if not pending:
+            return
+
+        print(
+            f"[S3] waiting up to {timeout_s:.0f}s for {len(pending)} upload(s) "
+            f"to finish - Ctrl-C again to abandon them",
+            flush=True,
+        )
+        deadline = time.monotonic() + timeout_s
+        try:
+            for thread in pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(timeout=remaining)
+        except KeyboardInterrupt:
+            print("[S3] upload wait interrupted", flush=True)
+
+        stranded = [t for t in self._upload_threads if t.is_alive()]
+        if stranded:
+            print(
+                f"[S3] {len(stranded)} upload(s) unfinished. Catch up with:\n"
+                f"     python tools/s3_resync_dataset.py "
+                f"--dataset-path {self.data_exporter.meta.root} "
+                f"--bucket {self.upload_bucket_path}",
+                flush=True,
+            )
+        else:
+            print("[S3] all uploads finished", flush=True)
 
     def _print_and_say(self, message: str, say: bool = True, blocking: bool = False):
         if self.text_to_speech is not None:
@@ -545,10 +754,12 @@ class GrootDataCollector:
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                saved_index = self.current_episode_index
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
                 self._print_and_say("Finished saving episode")
+                self._upload_episode(saved_index)
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
@@ -578,8 +789,12 @@ class GrootDataCollector:
 
         whole_q = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["body_q"],
-            left_hand_actuated_joint_values=proprio["left_hand_q"],
-            right_hand_actuated_joint_values=proprio["right_hand_q"],
+            left_hand_actuated_joint_values=self._hand_q_from_inspire(
+                "left", proprio["left_hand_q"]
+            ),
+            right_hand_actuated_joint_values=self._hand_q_from_inspire(
+                "right", proprio["right_hand_q"]
+            ),
         )
         whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["last_action"],
@@ -833,17 +1048,26 @@ class GrootDataCollector:
             self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                saved_index = self.current_episode_index
                 self.data_exporter.save_episode()
+                self._upload_episode(saved_index)
             self._print_and_say(
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
             )
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
+        self._finish_uploads()
+
         try:
             self._state_subscriber.close()
         except Exception:
             pass
+        if self._inspire_sub is not None:
+            try:
+                self._inspire_sub.close()
+            except Exception:
+                pass
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -924,6 +1148,16 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    if config.add_head_camera:
+        print("[Camera] Head camera enabled — adding head_view to dataset schema")
+        dataset_features.update(get_head_camera_features())
+        head_modality = get_head_camera_modality_config()
+        for key, value in head_modality.items():
+            if key in modality_config:
+                modality_config[key].update(value)
+            else:
+                modality_config[key] = value
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -936,7 +1170,12 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "add_head_camera": config.add_head_camera,
+            "hand_state_source": "inspire" if config.inspire_dump_port else "cpp",
+        },
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1189,11 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        upload_bucket_path=config.upload_bucket_path,
+        dataset_name=config.dataset_name,
+        inspire_dump_host=config.inspire_dump_host,
+        inspire_dump_port=config.inspire_dump_port,
+        inspire_state_max_age=config.inspire_state_max_age,
     )
     data_collector.run()
 

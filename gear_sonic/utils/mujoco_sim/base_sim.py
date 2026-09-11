@@ -198,7 +198,7 @@ class DefaultEnv:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model,
                     self.mj_data,
-                    key_callback=self.elastic_band.MujuocoKeyCallback,
+                    key_callback=self._viewer_key_callback,
                     show_left_ui=False,
                     show_right_ui=False,
                 )
@@ -208,7 +208,11 @@ class DefaultEnv:
         else:
             if self.onscreen:
                 self.viewer = mujoco.viewer.launch_passive(
-                    self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
+                    self.mj_model,
+                    self.mj_data,
+                    key_callback=self._viewer_key_callback,
+                    show_left_ui=False,
+                    show_right_ui=False,
                 )
             else:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
@@ -525,6 +529,16 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+
+    def _viewer_key_callback(self, key):
+        """Viewer keys: Backspace resets the scene; 7/8/9 drive the elastic band."""
+        import glfw
+
+        if key == glfw.KEY_BACKSPACE:
+            print("Viewer: Backspace pressed, resetting scene")
+            self.reset()
+        elif getattr(self, "elastic_band", None) is not None:
+            self.elastic_band.MujuocoKeyCallback(key)
 
 
 class BaseSimulator:

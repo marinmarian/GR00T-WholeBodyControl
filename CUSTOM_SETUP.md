@@ -196,8 +196,9 @@ third-party `XR-Robotics/XRoboToolkit-Orin-Video-Sender`, ported from its
 camera type), `run_headcam_sender.sh` (launch helper), and a README with full
 build / run / protocol details.
 
-**Current layout (2026-08): the sender runs on mjolnir**, composites the D455f color
-feed (left) with the g1 head-IR RTP push (right), and Remote Vision points at
+**Current layout (2026-09): the sender runs on mjolnir**, composites the OBSBOT Tiny 2
+Lite color feed (left; MJPEG 720p, `--pixfmt MJPG` — it replaced the RealSense D455f on
+2026-09-07) with the g1 head-IR RTP push (right), and Remote Vision points at
 `10.42.0.1` — full commands in `RUNBOOK.md`. The headset connects, sends `OPEN_CAMERA`
 with its callback ip:port; the sender replies with `OPEN_CAMERA_ACK` (required by 2026
 app versions — without it the client never renders) and streams H.264 back. Runs

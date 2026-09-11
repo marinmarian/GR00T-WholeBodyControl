@@ -14,7 +14,8 @@ from decoupled_wbc.control.robot_model.instantiation import g1
 from decoupled_wbc.control.sensor.composed_camera import ComposedCameraClientSensor
 from decoupled_wbc.control.utils.episode_state import EpisodeState
 from decoupled_wbc.control.utils.keyboard_dispatcher import KeyboardListenerSubscriber
-from decoupled_wbc.control.utils.ros_utils import ROSMsgSubscriber, ROSServiceClient
+from decoupled_wbc.control.utils.ros_utils import ROSMsgSubscriber
+from decoupled_wbc.control.utils.sonic_compat import adapt_cpp_state_msg, wait_for_robot_config
 from decoupled_wbc.control.utils.telemetry import Telemetry
 from decoupled_wbc.control.utils.text_to_speech import TextToSpeech
 from decoupled_wbc.data.exporter import DataCollectionInfo, Gr00tDataExporter
@@ -99,9 +100,13 @@ class Gr00tDataCollector:
         save_paths: EpisodeSavePaths | None = None,
         inspire_dump_host: str = "127.0.0.1",
         inspire_dump_port: int = 5558,
+        robot_model=None,
     ):
 
         self.text_to_speech = text_to_speech
+        # Needed to translate C++ deploy state (body_q/last_action) into the
+        # q/action/wrist_pose columns; see sonic_compat.adapt_cpp_state_msg.
+        self.robot_model = robot_model
         self.frequency = frequency
         self.data_exporter = data_exporter
         self.save_paths = save_paths
@@ -352,7 +357,7 @@ class Gr00tDataCollector:
                     with self.telemetry.timer("poll_state"):
                         msg = self._state_subscriber.get_msg()
                         if msg is not None:
-                            self.latest_proprio_msg = msg
+                            self.latest_proprio_msg = adapt_cpp_state_msg(msg, self.robot_model)
 
                     # 2. poll image msg
                     with self.telemetry.timer("poll_image"):
@@ -423,8 +428,9 @@ def main(config: DataExporterConfig):
         # This will be ignored if the dataset already exists
         data_collection_info = DataCollectionInfo()
 
-    robot_config_client = ROSServiceClient(ROBOT_CONFIG_TOPIC)
-    robot_config = robot_config_client.get_config()
+    # Python control loop serves this as a service, the C++ SONIC deploy
+    # publishes it as a transient_local topic; accept either.
+    robot_config = wait_for_robot_config(node, ROBOT_CONFIG_TOPIC)
 
     save_paths = EpisodeSavePaths(
         root_output_dir=config.root_output_dir,
@@ -455,6 +461,7 @@ def main(config: DataExporterConfig):
         save_paths=save_paths,
         inspire_dump_host=config.inspire_dump_host,
         inspire_dump_port=config.inspire_dump_port,
+        robot_model=g1_rm,
     )
     data_collector.run()
 

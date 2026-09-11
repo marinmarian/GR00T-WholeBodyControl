@@ -6,11 +6,14 @@
 #   ~/sonic-teleop.sh status   show what's running
 #
 # tmux session "sonic", two windows:
-#   svc : [xr-service] [cam-g1: head-IR RTP push] [cam-thor: composite sender]
+#   svc : [xr-service] [cam-g1: head-IR RTP push] [cam-thor: OBSBOT + composite sender]
 #   run : [streamer] [DEPLOY  <- 'O' = e-stop lives HERE]
 #
-# Policy: sonic_v1_1. Cameras: D455f color (thor, left half) + D430i IR (g1,
-# right half via RTP/UDP:5600). Remote Vision IP for the PICO = 10.42.0.1.
+# Policy: sonic_v1_1. Cameras: OBSBOT Tiny 2 Lite color (thor USB, left half;
+# MJPEG 1280x720@30 -> software jpegdec -> HW H.264) + D430i IR (g1, right half
+# via RTP/UDP:5600). Remote Vision IP for the PICO = 10.42.0.1.
+# OBSBOT: keep its AI tracking OFF (gimbal must not hunt during teleop); reset
+# pan/tilt/zoom with:  v4l2-ctl -d $CAM_COLOR -c pan_absolute=0,tilt_absolute=0,zoom_absolute=0
 #
 # Manual steps that stay manual:
 #   * PICO app: PC service 10.42.0.1 (WORKING); Head+Controller+Full body+Send;
@@ -20,19 +23,43 @@
 #   * xr-service may be another user's (root) — this script never kills it.
 
 S=sonic
-CAM_COLOR=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_455f_Intel_R__RealSense_TM__Depth_Camera_455f_254643069357-video-index0
+CAM_COLOR=/dev/v4l/by-id/usb-Remo_Tech_Co.__Ltd._OBSBOT_Tiny_2_Lite-video-index0
 CAM_G1=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_Intel_R__RealSense_TM__Depth_Camera_430i_349623061587-video-index2
 STREAMER_CMD='cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source xrt --inspire-hands trigger'
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
 DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
-# Both cameras live on g1 now: the IR push loops on localhost (5600 video branch,
-# 5601 the head recorder) and the composite sender runs on g1 itself.
+# Head IR is pushed from g1 to mjolnir over RTP (5600 = composite's right half,
+# 5601 = the dataset head_view recorder); the OBSBOT + composite sender run here.
 CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"'
-CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt YUY2 --width 1280 --height 720 --fps 15 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555'
-# Episode recording (LeRobot + S3 when creds present). Keys c/x/g/v/b in the KEYS
-# pane, or PICO gestures (right-stick click / A+Y) relayed over UDP 5559.
-EXPORTER_CMD='~/wbc-marin-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 127.0.0.1 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole_body_teleop}"'" --data-collection --no-add-stereo-camera --add-head-camera --no-text-to-speech'
-KEYS_CMD='~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys.py'
+CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt MJPG --width 1280 --height 720 --fps 30 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555'
+# Episode recording. EXPORTER=zmq (default) or EXPORTER=ros2.
+#
+# zmq  - gear_sonic/scripts/run_data_exporter.py. State + robot_config come from
+#        the C++ deploy's ZMQ output (g1_debug on 5557), camera from 5555. This is
+#        the path that WORKS on this stack. Episodes land in outputs/<dataset>/.
+#        Keys: left grip + A = start/stop+save, left grip + B = discard (via the
+#        streamer's manager_state topic), or c/x typed in the KEYS pane.
+#        Records ego_view + head_view; each saved episode is uploaded to
+#        s3://$DATASET_BUCKET/raw/<dataset>/ on a background thread (local files
+#        are the source of truth; a failed upload only warns). Still no episode
+#        ratings (g/v/b) on this path.
+# ros2 - decoupled_wbc/.../run_g1_data_exporter.py. Has ratings (g/v/b), S3 upload
+#        and head_view, and the right-stick-click / A+Y gestures over UDP 5559.
+#        BROKEN as of 2026-09-07: the deploy publishes nothing over ROS 2 (no
+#        g1_output_handler node, WBCPolicy/robot_config has Publisher count 0), so
+#        the exporter never leaves its "[robot_config] waiting ..." loop and every
+#        keypress is dropped. Not a DDS problem - discovery across the containers
+#        works. Restart the deploy and read its first ~40 lines for the ROS2 output
+#        handler's verdict before using this.
+if [ "${EXPORTER:-zmq}" = "ros2" ]; then
+  EXPORTER_CMD='~/wbc-marin-exec.sh python decoupled_wbc/control/main/teleop/run_g1_data_exporter.py --camera-host 127.0.0.1 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole_body_teleop}"'" --data-collection --no-add-stereo-camera --add-head-camera --no-text-to-speech'
+  KEYS_CMD='~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys.py'
+  RECORD_HELP='c=start/stop+save x=discard g/v/b=rate | PICO: right-stick click tap=c, hold 1.5s=x, A+Y=c'
+else
+  EXPORTER_CMD='~/wbc-marin-exec.sh python gear_sonic/scripts/run_data_exporter.py --camera-host 127.0.0.1 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole_body_teleop}"'" --add-head-camera --upload-bucket-path '"${DATASET_BUCKET:-darwin-robot-data}"' --no-text-to-speech'
+  KEYS_CMD='~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys_zmq.py'
+  RECORD_HELP='PICO: left grip + A = start/stop+save, left grip + B = discard | or c/x in the KEYS pane'
+fi
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 
 case "${1:-up}" in
@@ -67,6 +94,7 @@ up)
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "OrinVideoSenderI[R]"' 2>/dev/null
   pkill -f "g1_deploy_onnx_re[f]" 2>/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
+  docker exec wbc-marin bash -c 'pkill -f "run_.*data_exporte[r]"; pkill -f "record_key[s]"' 2>/dev/null
   sleep 1
 
   # 4. svc window: xr-service | cam-g1 | cam-thor
@@ -101,8 +129,9 @@ up)
   echo "        Remote Vision -> 10.42.0.1 (color left, head-IR right)"
   echo "  DO NOT press A+B+X+Y while the streamer says 'waiting for body data'."
   echo "  Drive: calibration pose -> A+B+X+Y (stand) -> A+X (whole-body POSE)."
-  echo "  Record: type in the KEYS pane (bottom-right): c=start/stop+save x=discard g/v/b=rate."
-  echo "          or PICO: right-stick click tap=start/stop+save, hold 1.5s=discard; A+Y held=start/stop. Rate g/v/b on keyboard."
+  echo "  Record (EXPORTER=${EXPORTER:-zmq}): $RECORD_HELP"
+  echo "          Watch the exporter pane for 'Started recording 0' - that is the only proof it took."
+  echo "          Episodes: ~/GR00T-WholeBodyControl/outputs/${DATASET:-g1_sonic}/"
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
 down)
@@ -115,7 +144,7 @@ down)
   pkill -f "OrinVideoSenderI[R]" 2>/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "OrinVideoSenderI[R]"' 2>/dev/null
   pkill -f "g1_deploy_onnx_re[f]" 2>/dev/null
-  docker exec wbc-marin bash -c 'pkill -f "run_g1_data_exporte[r]"; pkill -f "record_key[s]"' 2>/dev/null
+  docker exec wbc-marin bash -c 'pkill -f "run_.*data_exporte[r]"; pkill -f "record_key[s]"' 2>/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
   echo "[ok] stopped session, streamer, deploy, cameras, exporter."
   echo "     left running: xr-service (may be shared), igmp querier, hotspot."
@@ -128,9 +157,10 @@ status)
   echo -n "xr-service:     "; pgrep -f RoboticsServiceProcess >/dev/null && echo UP || echo down
   echo -n "streamer:       "; pgrep -f "pico_manage[r]_thread" >/dev/null && echo UP || echo down
   echo -n "deploy:         "; pgrep -f "g1_deploy_onnx_re[f]" >/dev/null && echo UP || echo down
-  echo -n "cam thor D455f: "; lsusb 2>/dev/null | grep -qi 455f && pgrep -f "OrinVideoSenderI[R]" >/dev/null && echo UP || echo down
+  echo -n "cam thor OBSBOT:"; [ -e "$CAM_COLOR" ] && pgrep -f "OrinVideoSenderI[R]" >/dev/null && echo " UP" || { [ -e "$CAM_COLOR" ] && echo " down (camera present, sender not running)" || echo " DOWN (OBSBOT not on USB)"; }
   echo -n "cam g1 push:    "; ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pgrep -f "gst-launc[h]" >/dev/null' 2>/dev/null && echo UP || echo down
-  echo -n "data exporter:  "; docker exec wbc-marin pgrep -f run_g1_data_exporter >/dev/null 2>&1 && echo UP || echo down
+  echo -n "data exporter:  "; docker exec wbc-marin pgrep -f "run_.*data_exporter" >/dev/null 2>&1 && echo UP || echo down
+  echo -n "record keys:    "; docker exec wbc-marin pgrep -f "record_key" >/dev/null 2>&1 && echo UP || echo down
   echo -n "robot lowlevel: "; ping -c1 -W1 192.168.123.161 >/dev/null 2>&1 && echo UP || echo DOWN
   echo -n "PICO on hotspot:"; ip neigh show dev wlP1p1s0 2>/dev/null | grep -q REACHABLE && echo " yes" || echo " not seen"
   ;;

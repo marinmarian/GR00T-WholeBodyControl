@@ -517,6 +517,12 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 # Joystick deadzone threshold
 JOYSTICK_DEADZONE = 0.15
 
+# manager_state publish rate, and the manager loop's poll rate. The loop used to
+# spin unthrottled and publish manager_state every iteration (~50 kHz), which
+# flooded the PUB socket and starved its other topics.
+MANAGER_STATE_PERIOD_S = 1.0 / 50.0
+MANAGER_POLL_PERIOD_S = 1.0 / 500.0
+
 
 class YawAccumulator:
     """Accumulates yaw heading angle based on joystick input."""
@@ -2069,6 +2075,16 @@ def run_pico_manager(
             bridge_kwargs["left_ip"] = inspire_left_ip
         if inspire_right_ip:
             bridge_kwargs["right_ip"] = inspire_right_ip
+        # Publish each tick's commanded + measured finger angles on the dump
+        # port (5558) so the data exporter can record real hand state. The C++
+        # deploy only knows Dex3 hands and streams zeros for hand_q otherwise.
+        try:
+            from gear_sonic.utils.teleop.inspire.inspire_dump import InspireDumpPublisher
+
+            bridge_kwargs["dump_publisher"] = InspireDumpPublisher()
+        except Exception as e:  # noqa: BLE001 - hands must keep working without it
+            print(f"[Manager] Inspire dump publisher unavailable (hand state not "
+                  f"recorded): {e}", flush=True)
         inspire_bridge = InspireBridge(
             get_inputs=lambda: get_controller_inputs(reader), **bridge_kwargs
         )
@@ -2146,6 +2162,9 @@ def run_pico_manager(
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    pending_toggle_dc = False
+    pending_toggle_da = False
+    last_manager_state_send = 0.0
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
@@ -2300,28 +2319,58 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
-            # Mode-independent: send manager_state for data exporter
+            # Mode-independent: send manager_state for data exporter.
+            # Left grip + A = start/stop+save, left grip + B = discard.
+            #
+            # This loop spins far faster than any consumer needs (~50 kHz), and
+            # sending every iteration floods the PUB socket: run_data_exporter.py
+            # drains only 20 messages per 50 Hz tick, so a one-shot toggle edge
+            # had ~2% odds of ever being read, and `pose` was buried too. Latch
+            # the edges instead and publish every MANAGER_STATE_PERIOD_S, plus
+            # immediately whenever a toggle is pending so a press has no
+            # added latency.
             toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
             toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
-            toggle_dc = toggle_dc_tmp and not prev_toggle_dc
-            toggle_da = toggle_da_tmp and not prev_toggle_da
+            pending_toggle_dc = pending_toggle_dc or (toggle_dc_tmp and not prev_toggle_dc)
+            pending_toggle_da = pending_toggle_da or (toggle_da_tmp and not prev_toggle_da)
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
-            socket.send(
-                pack_pose_message(
-                    {
-                        "stream_mode": np.array([current_mode.value], dtype=np.int32),
-                        "toggle_data_collection": np.array([toggle_dc], dtype=bool),
-                        "toggle_data_abort": np.array([toggle_da], dtype=bool),
-                    },
-                    topic="manager_state",
+
+            now_mgr = time.monotonic()
+            if (
+                pending_toggle_dc
+                or pending_toggle_da
+                or now_mgr - last_manager_state_send >= MANAGER_STATE_PERIOD_S
+            ):
+                socket.send(
+                    pack_pose_message(
+                        {
+                            "stream_mode": np.array([current_mode.value], dtype=np.int32),
+                            "toggle_data_collection": np.array(
+                                [pending_toggle_dc], dtype=bool
+                            ),
+                            "toggle_data_abort": np.array([pending_toggle_da], dtype=bool),
+                        },
+                        topic="manager_state",
+                    )
                 )
-            )
+                if pending_toggle_dc or pending_toggle_da:
+                    print(
+                        f"[Manager] recording toggle sent: "
+                        f"start/stop={pending_toggle_dc} discard={pending_toggle_da}"
+                    )
+                pending_toggle_dc = False
+                pending_toggle_da = False
+                last_manager_state_send = now_mgr
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+
+            # Poll at MANAGER_POLL_PERIOD_S rather than spinning a full core;
+            # 500 Hz catches any human press and leaves CPU for the 50 Hz policy.
+            time.sleep(MANAGER_POLL_PERIOD_S)
 
     except KeyboardInterrupt:
         print("\nStopping manager...")

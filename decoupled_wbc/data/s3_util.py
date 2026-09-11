@@ -141,30 +141,93 @@ def put_bytes_with_fallback(
     return StoreResult(uploaded=True, local_path=local_path, s3_uri=s3_uri)
 
 
+def upload_file_with_fallback(
+    *,
+    key: str,
+    local_path: Path,
+    bucket: Optional[str] = None,
+) -> StoreResult:
+    """Upload an existing local file, streaming from disk.
+
+    Unlike :func:`put_bytes_with_fallback` this never loads the file into memory
+    and uses boto3's managed (multipart) transfer, so it is the right call for
+    episode videos. The local file is the source of truth and is left untouched;
+    a failed upload warns and keeps it.
+    """
+    local_path = Path(local_path)
+    target_bucket = bucket or resolve_dataset_bucket()
+    s3_uri = f"s3://{target_bucket}/{key}"
+    if not local_path.is_file():
+        warning = f"WARNING: nothing to upload, missing {local_path}"
+        _emit_warning(warning)
+        return StoreResult(
+            uploaded=False, local_path=local_path, s3_uri=s3_uri, warning=warning
+        )
+    try:
+        _s3_client(resolve_aws_region()).upload_file(
+            str(local_path), target_bucket, key
+        )
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code") or "ClientError")
+    except Exception as exc:  # noqa: BLE001 - keep the episode local, never raise
+        code = type(exc).__name__
+    else:
+        return StoreResult(uploaded=True, local_path=local_path, s3_uri=s3_uri)
+
+    warning = f"WARNING: S3 upload failed ({code}); keeping local file {local_path}"
+    _emit_warning(warning)
+    return StoreResult(
+        uploaded=False,
+        local_path=local_path,
+        s3_uri=s3_uri,
+        warning=warning,
+        error_code=code,
+    )
+
+
 def try_upload_episode_files(
     *,
     local_root: Path,
     s3_prefix: str,
     bucket: Optional[str] = None,
+    include_videos: bool = False,
+    only_episode: Optional[int] = None,
 ) -> list[StoreResult]:
-    """Put parquet/meta under ``s3_prefix``. Videos stay local (too large)."""
+    """Put parquet/meta under ``s3_prefix``.
+
+    Videos are skipped by default (they used to be considered too large); pass
+    ``include_videos=True`` to stream them up with the managed transfer instead.
+    ``only_episode`` restricts data/video files to that episode index so a
+    long session does not re-upload every earlier episode after each save —
+    ``meta/`` is always included, since it is rewritten on every save.
+    """
     local_root = Path(local_root)
     results: list[StoreResult] = []
     if not local_root.is_dir():
         return results
     prefix = s3_prefix.strip("/")
+    episode_stem = None if only_episode is None else f"episode_{only_episode:06d}"
     for path in sorted(local_root.rglob("*")):
         if not path.is_file():
             continue
-        if path.suffix.lower() in _SKIP_UPLOAD_SUFFIXES:
+        is_video = path.suffix.lower() in _SKIP_UPLOAD_SUFFIXES
+        if is_video and not include_videos:
             continue
         rel = path.relative_to(local_root).as_posix()
+        if episode_stem is not None and not rel.startswith("meta/"):
+            if path.stem != episode_stem:
+                continue
         key = f"{prefix}/{rel}" if prefix else rel
-        results.append(
-            put_bytes_with_fallback(
-                key=key, body=path.read_bytes(), local_path=path, bucket=bucket
+        if is_video:
+            results.append(
+                upload_file_with_fallback(key=key, local_path=path, bucket=bucket)
             )
-        )
+        else:
+            results.append(
+                put_bytes_with_fallback(
+                    key=key, body=path.read_bytes(), local_path=path, bucket=bucket
+                )
+            )
     return results
 
 

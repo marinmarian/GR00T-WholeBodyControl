@@ -19,6 +19,10 @@ EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
 WRIST_VIEW_HEIGHT: int = 480
 WRIST_VIEW_WIDTH: int = 640
+# Head IR camera (D430i on the robot, pushed to the sender over RTP and teed
+# into the camera message as `head_view`) — 640x480, same as ego_view.
+HEAD_VIEW_HEIGHT: int = 480
+HEAD_VIEW_WIDTH: int = 640
 FPS: int = 50
 
 
@@ -391,6 +395,30 @@ def get_wrist_camera_modality_config() -> dict:
         "video": {
             "left_wrist": {"original_key": "observation.images.left_wrist"},
             "right_wrist": {"original_key": "observation.images.right_wrist"},
+        },
+    }
+
+
+def get_head_camera_features() -> dict:
+    """Features for the optional head camera (added when ``add_head_camera`` is enabled).
+
+    The camera sender already publishes `head_view` in every message alongside
+    `ego_view`; without these entries the frames are received and dropped.
+    """
+    return {
+        "observation.images.head_view": {
+            "dtype": "video",
+            "shape": [HEAD_VIEW_HEIGHT, HEAD_VIEW_WIDTH, 3],
+            "names": ["height", "width", "channel"],
+        },
+    }
+
+
+def get_head_camera_modality_config() -> dict:
+    """Modality config entries for the optional head camera."""
+    return {
+        "video": {
+            "head_view": {"original_key": "observation.images.head_view"},
         },
     }
 

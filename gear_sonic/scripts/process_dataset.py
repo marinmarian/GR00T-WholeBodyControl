@@ -36,6 +36,12 @@ Usage:
         --output-path outputs/merged \\
         --no-remove-stale-smpl
 
+    # Drop specific saved episodes (misfires, bad takes); survivors renumbered
+    python gear_sonic/scripts/process_dataset.py \\
+        --dataset-path outputs/my_dataset \\
+        --output-path outputs/my_dataset_cleaned \\
+        --exclude-episodes 0 1 2 --no-remove-stale-smpl
+
     # Remove discarded episodes (flagged during collection via 'x' key)
     python gear_sonic/scripts/process_dataset.py \\
         --dataset-path outputs/my_dataset \\
@@ -244,6 +250,7 @@ def process_single_dataset(
     remove_stale_smpl: bool,
     remove_discarded: bool = False,
     episode_index_offset: int = 0,
+    exclude_episodes: set[int] | None = None,
 ) -> dict:
     """Process one dataset: optionally clean stale SMPL frames.
 
@@ -255,6 +262,7 @@ def process_single_dataset(
     fps = info.get("fps", 50)
 
     discarded_indices = set(info.get("discarded_episode_indices", [])) if remove_discarded else set()
+    excluded_indices = set(exclude_episodes or ())
 
     stats = {
         "total_episodes": len(episodes_meta),
@@ -265,6 +273,7 @@ def process_single_dataset(
         "frozen_leadin_frames": 0,
         "episodes_dropped": 0,
         "episodes_discarded": 0,
+        "episodes_excluded": 0,
     }
     processed_episodes = []
 
@@ -274,6 +283,11 @@ def process_single_dataset(
         if ep_idx in discarded_indices:
             stats["episodes_discarded"] += 1
             print(f"  Episode {ep_idx}: discarded during collection — removing")
+            continue
+
+        if ep_idx in excluded_indices:
+            stats["episodes_excluded"] += 1
+            print(f"  Episode {ep_idx}: excluded by --exclude-episodes — removing")
             continue
 
         parquet_path = get_parquet_path(dataset_path, info, ep_idx)
@@ -405,6 +419,14 @@ def write_output_dataset(
 
     info["total_episodes"] = len(all_episodes)
     info["total_frames"] = total_frames
+    # total_videos/total_tasks/splits describe the OUTPUT, so recompute them —
+    # carrying the source values over leaves e.g. total_videos counting episodes
+    # that were just dropped.
+    info["total_videos"] = len(all_episodes) * len(get_video_keys(info))
+    if tasks_meta:
+        info["total_tasks"] = len(tasks_meta)
+    if "splits" in info:
+        info["splits"] = {"train": f"0:{len(all_episodes)}"}
     info.pop("discarded_episode_indices", None)
 
     with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
@@ -460,6 +482,13 @@ class ProcessDatasetConfig:
     """Remove episodes that were flagged as discarded during data collection
     (stored in meta/info.json under discarded_episode_indices)."""
 
+    exclude_episodes: list[int] = field(default_factory=list)
+    """Episode indices to drop, on top of the discarded ones — for takes that
+    were saved but are not wanted (misfires, bad runs). Indices refer to the
+    SOURCE dataset; surviving episodes are renumbered contiguously from 0. When
+    merging several datasets these apply to every input, so exclude in separate
+    runs if that is not what you want."""
+
 
 def main(cfg: ProcessDatasetConfig):
     dataset_paths = [Path(p) for p in cfg.dataset_path]
@@ -502,6 +531,8 @@ def main(cfg: ProcessDatasetConfig):
     print(f"  Output:               {output_path}{'  (in-place)' if in_place else ''}")
     print(f"  Remove stale SMPL:    {cfg.remove_stale_smpl}")
     print(f"  Remove discarded:     {cfg.remove_discarded}")
+    if cfg.exclude_episodes:
+        print(f"  Exclude episodes:     {sorted(cfg.exclude_episodes)}")
     print("=" * 70)
 
     # Validate script configs match across all datasets
@@ -534,6 +565,7 @@ def main(cfg: ProcessDatasetConfig):
         "frozen_leadin_frames": 0,
         "episodes_dropped": 0,
         "episodes_discarded": 0,
+        "episodes_excluded": 0,
     }
     reference_info = None
 
@@ -544,6 +576,7 @@ def main(cfg: ProcessDatasetConfig):
             remove_stale_smpl=cfg.remove_stale_smpl,
             remove_discarded=cfg.remove_discarded,
             episode_index_offset=len(all_episodes),
+            exclude_episodes=set(cfg.exclude_episodes),
         )
 
         if reference_info is None:
@@ -613,13 +646,20 @@ def main(cfg: ProcessDatasetConfig):
 
     # Print summary
     kept = total_stats["total_frames"] - total_stats["frames_removed"]
-    kept_episodes = total_stats["total_episodes"] - total_stats["episodes_dropped"] - total_stats["episodes_discarded"]
+    kept_episodes = (
+        total_stats["total_episodes"]
+        - total_stats["episodes_dropped"]
+        - total_stats["episodes_discarded"]
+        - total_stats["episodes_excluded"]
+    )
 
     print("\n" + "=" * 70)
     print("  Processing complete!")
     print("=" * 70)
     print(f"  Episodes:  {kept_episodes} kept / {total_stats['total_episodes']} total"
-          f"  ({total_stats['episodes_dropped']} dropped, {total_stats['episodes_discarded']} discarded)")
+          f"  ({total_stats['episodes_dropped']} dropped, "
+          f"{total_stats['episodes_discarded']} discarded, "
+          f"{total_stats['episodes_excluded']} excluded)")
     print(f"  Frames:    {kept} kept / {total_stats['total_frames']} total"
           f"  ({total_stats['frames_removed']} removed)")
     if total_stats["frames_removed"] > 0:

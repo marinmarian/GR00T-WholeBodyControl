@@ -457,3 +457,126 @@ class InspireDumpSubscriber:
                 self._ctx.term()
             except Exception:
                 pass
+
+
+class InspireHandStateSubscriber:
+    """Latest *per-side* mechanical snapshot from the ``inspire_hand`` topic.
+
+    ``InspireDumpSubscriber`` conflates the topic to one message, so with two
+    hands publishing alternately it returns whichever side spoke last. This
+    subscriber drains the queue every poll and keeps the newest valid snapshot
+    for ``"left"`` and ``"right"`` separately, stamped with the local receive
+    time so a caller can reject stale state.
+    """
+
+    def __init__(self, host=INSPIRE_DUMP_HOST, port=INSPIRE_DUMP_PORT, ctx=None):
+        self._owns_ctx = ctx is None
+        self._ctx = ctx if ctx is not None else zmq.Context()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.SUBSCRIBE, INSPIRE_HAND_TOPIC.encode("utf-8"))
+        self._sock.setsockopt(zmq.RCVHWM, 64)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(f"tcp://{host}:{port}")
+        self._latest = {"left": None, "right": None}
+        self._recv_mono = {"left": None, "right": None}
+        print(f"[InspireDump] hand-state SUB tcp://{host}:{port} topic={INSPIRE_HAND_TOPIC}",
+              flush=True)
+
+    def poll(self, max_msgs=64):
+        import time as _time
+
+        for _ in range(max_msgs):
+            try:
+                parts = self._sock.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            if len(parts) < 2:
+                continue
+            try:
+                msg = msgpack.unpackb(parts[1], raw=False)
+            except Exception:
+                continue
+            side = msg.get("side")
+            if side not in self._latest:
+                continue
+            self._latest[side] = msg
+            self._recv_mono[side] = _time.monotonic()
+
+    def get_actual(self, side, max_age_s=None):
+        """Return (actual_angles list[6], age_s) for ``side`` or (None, None).
+
+        ``None`` when nothing has arrived, the snapshot is flagged invalid
+        (hand unreachable), or it is older than ``max_age_s``.
+        """
+        import time as _time
+
+        self.poll()
+        msg = self._latest.get(side)
+        if msg is None or not msg.get("valid", 0):
+            return None, None
+        age = _time.monotonic() - self._recv_mono[side]
+        if max_age_s is not None and age > max_age_s:
+            return None, age
+        actual = msg.get("actual")
+        if not actual or len(actual) < Inspire_Num_Motors:
+            return None, age
+        return list(actual[:Inspire_Num_Motors]), age
+
+    def close(self):
+        try:
+            self._sock.close(0)
+        except Exception:
+            pass
+        if self._owns_ctx:
+            try:
+                self._ctx.term()
+            except Exception:
+                pass
+
+
+# Inspire angle register: 1000 = fully open, 0 = fully closed. DOF order is
+# [little, ring, middle, index, thumb_bend, thumb_rot] (INSPIRE_DOF_NAMES).
+INSPIRE_ANGLE_OPEN = 1000
+_INSPIRE_FINGER_DOFS = (0, 1, 2, 3)
+_INSPIRE_THUMB_BEND_DOF = 4
+
+
+def inspire_closure_ratios(actual):
+    """(finger_ratio, thumb_ratio) in [0, 1] from Inspire ANGLE_ACT registers.
+
+    0 = open, 1 = closed. Finger ratio is the mean of the four finger DOFs.
+    Thumb rotation is ignored: it is parked at a fixed rest angle by the bridge
+    and has no counterpart in the G1 three-finger hand model.
+    """
+    a = np.asarray(actual, dtype=np.float64)
+    fingers = 1.0 - a[list(_INSPIRE_FINGER_DOFS)] / float(INSPIRE_ANGLE_OPEN)
+    thumb = 1.0 - a[_INSPIRE_THUMB_BEND_DOF] / float(INSPIRE_ANGLE_OPEN)
+    return float(np.clip(fingers.mean(), 0.0, 1.0)), float(np.clip(thumb, 0.0, 1.0))
+
+
+# G1 three-finger hand actuated-joint order (RobotModel.get_hand_actuated_joint_indices):
+# [thumb_0, thumb_1, thumb_2, index_0, index_1, middle_0, middle_1]. Note this is NOT
+# the order of the hand joints inside observation.state (index, middle, thumb).
+G1_HAND_THUMB_SLOTS = (0, 1, 2)
+G1_HAND_FINGER_SLOTS = (3, 4, 5, 6)
+
+
+def inspire_actual_to_g1_hand_q(
+    actual, open_q, closed_q, thumb_slots=G1_HAND_THUMB_SLOTS, finger_slots=G1_HAND_FINGER_SLOTS
+):
+    """Map Inspire angles onto the 7-DoF G1 hand actuated-joint vector.
+
+    ``open_q`` / ``closed_q`` are the 7-vectors the hand retargeting solver
+    produces for an open hand and a fully closed grip, so the returned state
+    lives in exactly the same space as ``teleop.*_hand_joints`` and the hand
+    slots of ``action.wbc``. ``finger_slots`` (index/middle joints) follow the
+    finger closure ratio, ``thumb_slots`` follow the thumb-bend ratio. Pass the
+    slot tuples derived from the robot model's joint names when available.
+    """
+    open_q = np.asarray(open_q, dtype=np.float64).reshape(-1)
+    closed_q = np.asarray(closed_q, dtype=np.float64).reshape(-1)
+    finger_ratio, thumb_ratio = inspire_closure_ratios(actual)
+    ratios = np.zeros(open_q.shape[0], dtype=np.float64)
+    ratios[list(thumb_slots)] = thumb_ratio
+    ratios[list(finger_slots)] = finger_ratio
+    return open_q + ratios * (closed_q - open_q)
