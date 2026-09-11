@@ -42,6 +42,12 @@ from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.teleop.inspire.inspire_dump import (
+    INSPIRE_DUMP_HOST,
+    INSPIRE_DUMP_PORT,
+    InspireHandStateSubscriber,
+    inspire_actual_to_g1_hand_q,
+)
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -111,8 +117,19 @@ class InferenceConfig:
     """Embodiment tag for policy inference."""
 
     # Prompt / eval
-    prompt: str = "demo"
-    """The language prompt for the VLA policy."""
+    prompt: str = "put bottles with red cap in red bottle holder"
+    """The language prompt for the VLA policy (default = the restocking training prompt)."""
+
+    # Inspire hands (this rig): real hand state comes from the Inspire bridge dump port,
+    # not from the C++ deploy (Dex3-only, streams zeros). 0 disables and uses C++ hand_q.
+    inspire_dump_host: str = INSPIRE_DUMP_HOST
+    inspire_dump_port: int = INSPIRE_DUMP_PORT
+    inspire_state_max_age: float = 0.25
+    """Seconds after which an Inspire snapshot is stale -> fall back to C++ hand_q (warns)."""
+
+    initial_motion_token_path: str = ""
+    """Optional .npy with a 64-dim motion token for the initial pose (extracted from our
+    own demonstrations). Empty = NVIDIA default LATENT_INITIAL_MOTION_TOKEN."""
 
     # Initial pose
     initial_pose_blend_duration: float = 1.0
@@ -123,6 +140,10 @@ class InferenceConfig:
     # Debug
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
+
+
+# Max age difference between camera views in one message before the observation is dropped.
+MAX_VIEW_SKEW_S = 0.5
 
 
 def print_green(x):
@@ -215,8 +236,15 @@ def prepare_observation_from_sensors(
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
+    video_keys=("ego_view",),
+    hand_state_fn=None,
 ):
     """Read sensors and prepare observation for the VLA policy.
+
+    ``video_keys`` are the camera keys the policy server advertises (queried at
+    startup); every one of them must be present in the camera message or the
+    observation is skipped. ``hand_state_fn(state_msg) -> (left_q7, right_q7)``
+    supplies the 7-DoF hand state (Inspire hands); ``None`` = C++ Dex3 hand_q.
 
     Returns:
         observation dict, or None if sensor data not yet available.
@@ -233,23 +261,47 @@ def prepare_observation_from_sensors(
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
         return None
 
-    cam_img = camera_msg["images"]["ego_view"]
+    images = camera_msg["images"]
+    missing = [k for k in video_keys if k not in images]
+    if missing:
+        if log_errors:
+            print(
+                f"[DEBUG] prepare_observation: camera message lacks {missing} "
+                f"(has {sorted(images.keys())}); skipping this observation",
+                flush=True,
+            )
+        return None
+    # All views must be fresh relative to each other: the camera sender keeps re-sending the
+    # LAST head_view JPEG if the g1 RTP push dies, so a present key is not proof of a live view.
+    stamps = camera_msg.get("timestamps", {})
+    if len(video_keys) > 1 and all(k in stamps for k in video_keys):
+        newest = max(stamps[k] for k in video_keys)
+        stale = {k: newest - stamps[k] for k in video_keys if newest - stamps[k] > MAX_VIEW_SKEW_S}
+        if stale:
+            if log_errors:
+                print(
+                    "[DEBUG] prepare_observation: stale camera view(s) "
+                    + ", ".join(f"{k} lags {v * 1000:.0f} ms" for k, v in stale.items())
+                    + " — skipping this observation (head camera push dead?)",
+                    flush=True,
+                )
+            return None
+    video = {k: images[k][np.newaxis, np.newaxis] for k in video_keys}
+    primary_key = video_keys[0]
 
-    # Copy index finger data to middle finger (hardware coupling)
-    state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
-    state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
+    if hand_state_fn is not None:
+        left_hand_q, right_hand_q = hand_state_fn(state_msg)
+    else:
+        # Dex3 hands: copy index finger data to middle finger (hardware coupling)
+        state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
+        state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
+        left_hand_q, right_hand_q = state_msg["left_hand_q"], state_msg["right_hand_q"]
 
     qpos = robot_model.get_configuration_from_actuated_joints(
         body_actuated_joint_values=state_msg["body_q"],
-        left_hand_actuated_joint_values=state_msg["left_hand_q"],
-        right_hand_actuated_joint_values=state_msg["right_hand_q"],
+        left_hand_actuated_joint_values=left_hand_q,
+        right_hand_actuated_joint_values=right_hand_q,
     )
-
-    video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
-    if "left_wrist" in camera_msg["images"]:
-        video["left_wrist"] = camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
-    if "right_wrist" in camera_msg["images"]:
-        video["wrist_view"] = camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis]
 
     observation = {
         "video": video,
@@ -258,7 +310,7 @@ def prepare_observation_from_sensors(
             "annotation.human.task_description": [[language_prompt]],
         },
         "q": np.asarray(qpos, dtype=np.float32)[np.newaxis, np.newaxis],
-        "timestamps": camera_msg["timestamps"]["ego_view"],
+        "timestamps": camera_msg["timestamps"][primary_key],
     }
 
     observation = prepare_observation_for_eval(robot_model, observation)
@@ -367,16 +419,86 @@ def main(config: InferenceConfig):
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
-    # Isaac-GR00T PolicyClient
-    from gr00t.policy.server_client import PolicyClient
+    # Isaac-GR00T PolicyClient (the real package needs Python >= 3.12; on this Jetson the
+    # .venv_inference is 3.10, so fall back to the vendored wire-compatible client).
+    try:
+        from gr00t.policy.server_client import PolicyClient
+    except ImportError:
+        from gear_sonic.utils.inference.gr00t_client import PolicyClient
 
     n1_policy = PolicyClient(host=config.host, port=config.port)
 
     print(f"Connecting to PolicyServer at {config.host}:{config.port}...")
+    video_keys = ("ego_view",)
     if n1_policy.ping():
         print_green("PolicyServer is reachable.")
+        try:
+            server_mc = n1_policy.get_modality_config()
+            video_keys = tuple(server_mc["video"].modality_keys)
+            print_green(f"Policy video keys (from server): {list(video_keys)}")
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: could not query modality config ({e}); assuming {list(video_keys)}")
     else:
         print("WARNING: PolicyServer not reachable. Inference will fail until server is up.")
+
+    # Initial pose token: our own demonstrations' standing pose, if provided.
+    global LATENT_INITIAL_MOTION_TOKEN
+    if config.initial_motion_token_path:
+        tok = np.load(config.initial_motion_token_path).astype(np.float32).reshape(-1)
+        assert tok.shape == (64,), f"initial motion token must be 64-dim, got {tok.shape}"
+        LATENT_INITIAL_MOTION_TOKEN = tok
+        print_green(f"Initial motion token loaded from {config.initial_motion_token_path}")
+
+    # Inspire hand state -> 7-DoF G1 hand joints, exactly as the data exporter recorded it.
+    hand_state_fn = None
+    if config.inspire_dump_port:
+        try:
+            inspire_sub = InspireHandStateSubscriber(
+                host=config.inspire_dump_host, port=config.inspire_dump_port
+            )
+        except Exception as e:  # noqa: BLE001
+            inspire_sub = None
+            print(f"WARNING: Inspire hand-state SUB failed ({e}); using C++ hand_q (zeros!)")
+        if inspire_sub is not None:
+            hand_open_q, hand_closed_q, hand_thumb_slots, hand_finger_slots = {}, {}, {}, {}
+            for side in ("left", "right"):
+                solver = G1GripperInverseKinematicsSolver(side=side)
+                fingertips = np.zeros([25, 4, 4])
+                fingertips[4, 0, 3] = 1.0  # thumb tip (generate_finger_data)
+                hand_open_q[side] = np.asarray(solver({"position": fingertips}), dtype=np.float64).reshape(-1)
+                fingertips[14, 0, 3] = 1.0  # middle tip -> closed grip
+                hand_closed_q[side] = np.asarray(solver({"position": fingertips}), dtype=np.float64).reshape(-1)
+                hand_idx = list(robot_model.get_hand_actuated_joint_indices(side))
+                slot_names = [robot_model.joint_names[i] for i in hand_idx]
+                hand_thumb_slots[side] = tuple(k for k, nm in enumerate(slot_names) if "thumb" in nm)
+                hand_finger_slots[side] = tuple(k for k, nm in enumerate(slot_names) if "thumb" not in nm)
+            inspire_warn = {"t": 0.0}
+
+            def hand_state_fn(state_msg, _sub=inspire_sub):
+                # The bridge publishes ~180 msg/s and get_actual() drains only 64 per call; at
+                # our 2.5 Hz inference rate that would lag by seconds. Drain fully first.
+                _sub.poll(max_msgs=100000)
+                out = []
+                for side, key in (("left", "left_hand_q"), ("right", "right_hand_q")):
+                    actual, age = _sub.get_actual(side, max_age_s=config.inspire_state_max_age)
+                    if actual is None:
+                        now = time.time()
+                        if now - inspire_warn["t"] >= 5.0:
+                            inspire_warn["t"] = now
+                            why = "no snapshot yet" if age is None else f"stale ({age * 1000:.0f} ms)"
+                            print(f"[Inspire] {side} hand state unavailable ({why}); using C++ hand_q", flush=True)
+                        out.append(np.asarray(state_msg[key], dtype=np.float32))
+                    else:
+                        out.append(
+                            inspire_actual_to_g1_hand_q(
+                                actual, hand_open_q[side], hand_closed_q[side],
+                                thumb_slots=hand_thumb_slots[side], finger_slots=hand_finger_slots[side],
+                            ).astype(np.float32)
+                        )
+                return out[0], out[1]
+
+            print_green("Hand state source: Inspire bridge (dump port "
+                        f"{config.inspire_dump_host}:{config.inspire_dump_port})")
 
     state_subscriber = ZMQStateSubscriber(
         host=config.state_zmq_host,
@@ -579,18 +701,23 @@ def main(config: InferenceConfig):
             else:
                 print("Policy loop resumed")
         elif key == "k":
+            # Stateless on purpose: the C++ deploy may have been restarted behind our back (it
+            # exits on any error), so a toggle keyed on our own bookkeeping sends STOP when the
+            # operator means START. 'k' always starts (PLANNER mode); 'x' always stops.
             if cpp_loop_running:
-                current_planner = cpp_mode == "PLANNER"
-                print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
-                if send_cpp_control_command(start=False, planner=current_planner):
-                    print("Stopped C++ control loop")
-            else:
-                print("Starting C++ control loop in PLANNER mode...")
-                if send_cpp_control_command(start=True, planner=True):
-                    print("Started C++ control loop in PLANNER mode")
-                    print("Press 'i' to send initial pose and switch to POSE mode")
-                    if pause_loop:
-                        print("Note: Policy loop is paused - press 'p' to resume")
+                print(f"Note: we believed the C++ loop was already running ({cpp_mode}); re-sending START anyway")
+            print("Starting C++ control loop in PLANNER mode...")
+            if send_cpp_control_command(start=True, planner=True):
+                print("Started C++ control loop in PLANNER mode")
+                print("Press 'i' to send initial pose and switch to POSE mode")
+                if pause_loop:
+                    print("Note: Policy loop is paused - press 'p' to resume")
+        elif key == "x":
+            current_planner = cpp_mode == "PLANNER"
+            print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
+            pause_loop = True
+            if send_cpp_control_command(start=False, planner=current_planner):
+                print("Stopped C++ control loop (policy paused)")
         elif key == "[":
             initial_pose_left_hand_closed = not initial_pose_left_hand_closed
             print(
@@ -625,6 +752,8 @@ def main(config: InferenceConfig):
                 robot_model=robot_model,
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
+                video_keys=video_keys,
+                hand_state_fn=hand_state_fn,
             ),
             lambda obs: run_policy_inference_and_process(
                 policy=n1_policy,

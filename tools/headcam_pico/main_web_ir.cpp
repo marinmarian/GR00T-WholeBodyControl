@@ -6,6 +6,9 @@
 // callback ip:port, and we open a return TCP connection and stream H.264 to it),
 // but replaces the ZED SDK capture with a direct v4l2 GStreamer pipeline reading
 // the RealSense IR node (/dev/video2, GRAY8 640x480) and HW-encoding to H.264.
+// Any V4L2 camera works via --device/--pixfmt/--width/--height/--fps; --pixfmt MJPG
+// takes the camera's Motion-JPEG mode (UVC webcams such as the OBSBOT Tiny 2 Lite
+// only offer 720p+ as MJPEG) and decodes it in software before the HW encoder.
 // The "only ZED cameras" rejection is removed so any Remote-Vision source works.
 #include <atomic>
 #include <chrono>
@@ -206,6 +209,9 @@ bool g_letterbox = true;  // preserve aspect on the requested canvas (--fit stre
 // so run_g1_data_exporter can record episodes from the same camera that feeds
 // the headset. Frames flow only while a Remote Vision session is streaming.
 int g_zmq_pub_port = 0;
+// --autostart: run the capture pipeline (and the --zmq-pub data tee) from startup,
+// without waiting for a headset OPEN_CAMERA. Used for headset-free VLA inference.
+bool g_autostart = false;
 void *g_zmq_ctx = nullptr;
 void *g_zmq_pub = nullptr;
 const int DATA_W = 640, DATA_H = 480;  // dataset ego_view shape (RS_VIEW_*)
@@ -217,6 +223,23 @@ int g_cap2_width = 640;
 int g_cap2_height = 480;
 int g_cap2_fps = 15;
 int g_flip2 = 0;
+
+// Capture head for one local V4L2 camera:
+//   "v4l2src ! <caps> ! [jpegdec !] videoconvert ! video/x-raw,format=I420 ! "
+// pixfmt MJPG/MJPEG/JPEG selects the camera's Motion-JPEG mode (software jpegdec —
+// nvjpegdec fails on UVC MJPEG streams here); anything else is a raw
+// video/x-raw format string (GRAY8, YUY2, UYVY, ...).
+static std::string v4l2_capture_head(const std::string &dev, const std::string &pixfmt,
+                                     int w, int h, int fps) {
+  std::string dims = ",width=" + std::to_string(w) + ",height=" + std::to_string(h) +
+                     ",framerate=" + std::to_string(fps) + "/1 ! ";
+  std::string s = "v4l2src device=" + dev + " ! ";
+  if (pixfmt == "MJPG" || pixfmt == "MJPEG" || pixfmt == "JPEG")
+    s += "image/jpeg" + dims + "jpegdec ! ";
+  else
+    s += "video/x-raw,format=" + pixfmt + dims;
+  return s + "videoconvert ! video/x-raw,format=I420 ! ";
+}
 
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_helper(Args &&...args) {
@@ -680,13 +703,19 @@ void stopStreamingThread() {
 void streamingThreadFunction() {
   std::cout << "Streaming thread started" << std::endl;
   try {
-    if (!initialize_sender()) {
+    if (send_to_server.empty()) {
+      // --autostart with no headset yet: capture + ZMQ data tee only, no TCP video.
+      std::cout << "Autostart: capture running without a headset video sink" << std::endl;
+      sender_ptr = nullptr;
+      send_enabled.store(false);
+    } else if (!initialize_sender()) {
       std::cerr << "Failed to initialize sender, streaming thread stopping"
                 << std::endl;
       return;
+    } else {
+      send_enabled.store(true);
     }
     encoding_enabled.store(true);
-    send_enabled.store(true);
 
     CameraRequestData config;
     {
@@ -771,12 +800,8 @@ void streamingThreadFunction() {
                "rtpjpegdepay ! jpegdec ! videoconvert ! video/x-raw,format=I420 ! "
                "queue leaky=downstream max-size-buffers=3 ! ";
       } else {
-        src2 = "v4l2src device=" + g_device2 + " ! "
-               "video/x-raw,format=" + g_pixfmt2 +
-               ",width=" + std::to_string(g_cap2_width) +
-               ",height=" + std::to_string(g_cap2_height) +
-               ",framerate=" + std::to_string(g_cap2_fps) + "/1 ! "
-               "videoconvert ! video/x-raw,format=I420 ! ";
+        src2 = v4l2_capture_head(g_device2, g_pixfmt2, g_cap2_width, g_cap2_height,
+                                 g_cap2_fps);
       }
 
       pipeline_str =
@@ -791,12 +816,8 @@ void streamingThreadFunction() {
           " sink_1::width=" + std::to_string(w1) + " sink_1::height=" + std::to_string(h1) +
           " ! video/x-raw,format=I420,width=" + std::to_string(outW) +
           ",height=" + std::to_string(outH) + " ! " + encode_tail +
-          "  v4l2src device=" + g_device + " ! "
-          "video/x-raw,format=" + g_pixfmt +
-          ",width=" + std::to_string(g_cap_width) +
-          ",height=" + std::to_string(g_cap_height) +
-          ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
-          "videoconvert ! video/x-raw,format=I420 ! " + flip1 + data_branch + "comp.sink_0"
+          "  " + v4l2_capture_head(g_device, g_pixfmt, g_cap_width, g_cap_height, g_cap_fps) +
+          flip1 + data_branch + "comp.sink_0"
           "  " + src2 + flip2 + "comp.sink_1";
     } else {
       std::string mid;
@@ -816,12 +837,8 @@ void streamingThreadFunction() {
                " bottom=-" + std::to_string(padB) + " ! ";
       }
       pipeline_str =
-          "v4l2src device=" + g_device + " ! "
-          "video/x-raw,format=" + g_pixfmt +
-          ",width=" + std::to_string(g_cap_width) +
-          ",height=" + std::to_string(g_cap_height) +
-          ",framerate=" + std::to_string(g_cap_fps) + "/1 ! "
-          "videoconvert ! video/x-raw,format=I420 ! " + data_branch + mid + encode_tail;
+          v4l2_capture_head(g_device, g_pixfmt, g_cap_width, g_cap_height, g_cap_fps) +
+          data_branch + mid + encode_tail;
     }
     std::cout << "Pipeline: " << pipeline_str << std::endl;
 
@@ -904,6 +921,8 @@ int main(int argc, char *argv[]) {
       g_cap_fps = std::stoi(argv[++i]);
     } else if (arg == "--flip" && i + 1 < argc) {
       g_flip = std::stoi(argv[++i]);
+    } else if (arg == "--autostart") {
+      g_autostart = true;
     } else if (arg == "--zmq-pub" && i + 1 < argc) {
       g_zmq_pub_port = std::stoi(argv[++i]);
     } else if (arg == "--max-bitrate" && i + 1 < argc) {
@@ -932,13 +951,16 @@ int main(int argc, char *argv[]) {
                 << "  callback ip:port, and we stream H.264 back to it.\n"
                 << "Options (defaults = D430i left-IR head cam):\n"
                 << "  --device /dev/video2   V4L2 node\n"
-                << "  --pixfmt GRAY8         GStreamer format (GRAY8, YUY2, UYVY)\n"
+                << "  --pixfmt GRAY8         GStreamer raw format (GRAY8, YUY2, UYVY) or MJPG\n"
+                << "                         (camera's Motion-JPEG mode, decoded in software)\n"
                 << "  --width 640 --height 480 --fps 30\n"
                 << "  --flip 0               nvvidconv flip-method (1=90ccw, 2=180, 3=90cw)\n"
                 << "Examples:\n"
                 << "  " << argv[0] << " --listen 0.0.0.0:13579\n"
                 << "  " << argv[0] << " --listen 0.0.0.0:13580 --device /dev/video0"
-                   " --pixfmt YUY2 --width 1280 --height 704 --fps 15\n";
+                   " --pixfmt YUY2 --width 1280 --height 704 --fps 15\n"
+                << "  " << argv[0] << " --listen 0.0.0.0:13579 --device /dev/video0"
+                   " --pixfmt MJPG --width 1280 --height 720 --fps 30   (OBSBOT Tiny 2 Lite)\n";
       return 0;
     }
   }
@@ -961,6 +983,12 @@ int main(int argc, char *argv[]) {
               << std::endl;
     if (g_device2.rfind("udp:", 0) == 0)
       start_head_recorder(std::stoi(g_device2.substr(4)) + 1);
+  }
+
+  if (g_autostart) {
+    std::cout << "Autostart: starting capture pipeline now (--zmq-pub tee active)"
+              << std::endl;
+    startStreamingThread();
   }
 
   std::cout << "Starting IR video streaming server (listen " << listen_address
