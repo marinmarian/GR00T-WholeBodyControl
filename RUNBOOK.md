@@ -349,31 +349,107 @@ and commit working-tree changes promptly: uncommitted edits have vanished here.
 one-liner in CUSTOM_SETUP.md). `InvalidAccessKeyId` = key
 deactivated/rotated — ask the account owner.
 
-## VLA inference (GR00T N1.7 restocking policy) — added 2026-09-11
+## VLA inference (GR00T N1.7 restocking policy)
 
-One command, mirrors the teleop runner:
-```bash
-~/GR00T-WholeBodyControl/tools/vla-inference.sh up      # PROMPT=... HANDS=0 POLICY_MODEL=... overrides
-tmux attach -t vla                                        # down: tools/vla-inference.sh down
-```
+Runs the fine-tuned GR00T N1.7 policy on the real G1: the policy server on the EC2 GPU box
+(`darwin-gpu`), everything else on mjolnir. Same SONIC deploy, cameras and Inspire hands as
+teleop; `run_vla_inference.py` takes the PICO streamer's place on ZMQ 5556/5557.
+
+### What runs where
+
 | piece | where | notes |
 |---|---|---|
-| PolicyServer (Isaac-GR00T) | **darwin-gpu** (EC2, RTX PRO 6000) | `ssh darwin-gpu '~/serve_policy.sh v2\|best34'` — tmux `policy`. Checkpoints: `~/checkpoints/restocking_{v2,best34}/…/checkpoint-10000`. Always passes `~/configs/g1_sonic_two_cam.py`. |
-| SSH tunnel | mjolnir `svc` pane | `ssh -N -L 5550:127.0.0.1:5550 ubuntu@13.40.142.104` (auto-retry). EC2 SG does not open 5550; mjolnir's ed25519 key is authorised on darwin-gpu. RTT ~10 ms, one inference ≈ 0.25 s (budget 0.4 s at 2.5 Hz). |
-| camera sender | mjolnir `svc` pane | same OBSBOT + head-IR composite as teleop **plus `--autostart`**: capture + ZMQ 5555 tee run without a PICO Remote Vision session. `ego_view` = OBSBOT side view, `head_view` = D430i IR (needs the g1 gst push, auto-started when g1 answers ping). |
-| C++ deploy | mjolnir `run` pane, `g1-deploy-dev` container | identical command to teleop (`--input-type zmq_manager --output-type all`); `run_vla_inference.py` replaces the PICO streamer on 5556/5557. **The PICO streamer must be down** (same port). |
-| `run_vla_inference.py` | mjolnir `.venv_inference` | patched: video keys queried from the server (`[head_view, ego_view]`), Inspire hand STATE from the dump port 5558 (exporter's mapping), vendored `PolicyClient` (Isaac-GR00T needs py3.12), `--initial-motion-token-path` = standing token averaged from our episodes, default prompt = training prompt. |
-| `inspire_vla_bridge.py` | mjolnir `run` pane | NEW. SUB 5556 `pose` → 7-DoF hand actions → closure ratio (≥0.5 = closed) → Inspire Modbus; PUB measured state on 5558. Reuses `InspireBridge`; Ctrl-C/crash → hands open. Without it hands never move (deploy drives Dex3 only) and hand state is zeros. |
-| keys | mjolnir `run` pane | `tools/vla_keys.py` → ZMQ 5580. `k` START C++ loop (always), `x` STOP it, `i` initial pose, `p` run/pause policy, `t <text>` prompt. |
+| PolicyServer (Isaac-GR00T) | darwin-gpu, tmux `policy` | `~/serve_policy.sh v2\|best34` (stops a previous server on the port itself). Checkpoints `~/checkpoints/restocking_{v2,best34}/…/checkpoint-10000`. Always passes the two-camera modality config. |
+| SSH tunnel to 5550 | mjolnir, `vla` session, `svc` window | EC2 does not open 5550; mjolnir's ed25519 key is authorised on darwin-gpu. RTT ~10 ms, one inference ≈ 0.25 s (budget 0.4 s at 2.5 Hz). |
+| head-IR push | g1 → mjolnir udp 5600/5601 | started automatically once g1 answers ping |
+| camera sender | mjolnir, `svc` window | teleop command **+ `--autostart`**: capture and the ZMQ 5555 tee run without a PICO Remote Vision session. `ego_view` = OBSBOT side view, `head_view` = D430i IR. |
+| C++ deploy | mjolnir, `run` window, `g1-deploy-dev` container | `./run_sonic.sh` = the teleop command (`--input-type zmq_manager --output-type all`). |
+| `run_vla_inference.py` | mjolnir `.venv_inference` | camera keys from the server, Inspire hand state from dump port 5558, initial pose token from our own episodes, training prompt as default |
+| `inspire_vla_bridge.py` | mjolnir | policy hand actions → Inspire hands (Modbus) and measured hand state → 5558. Without it the hands never move (the deploy only knows Dex3) and the hand state is zeros. |
+| `tools/vla_keys.py` | mjolnir | operator keys → ZMQ 5580 |
 
-Operator sequence: deploy `Init Done` (hoist!) → inference pane shows `PolicyServer is reachable` + `Policy video keys` + image latency lines for BOTH views → keys: `k`, `i`, then `p` (`x` stops the C++ loop). E-stop `O` in the deploy pane. Prompt must stay `put bottles with red cap in red bottle holder`.
+### Before you start
 
-Verified 2026-09-11 without the robot: synthetic observation → server → 40×(64+7+7) actions in 0.25 s; sender `--autostart` at 30 Hz; hand mapping unit test; bridge dry-run; inference script startup. NOT yet verified: g1 head push + `head_view` in the live message, Inspire Modbus writes from the bridge, deploy ↔ inference handshake, closed loop.
+1. Robot powered, **on the hoist**, in damping. Inspire hands powered (192.168.123.210/.211).
+2. Cameras: OBSBOT on mjolnir USB, D430i on g1 — same physical placement as during recording.
+   Check with the training-vs-live picture: `~/Desktop/restocking_eval/live/cam_compare.sh` on the Mac
+   (needs the sender running). The side camera must show the table the way the recordings do.
+3. **Teleop must be down** (`tools/sonic-teleop.sh down`): the PICO streamer and the VLA client both bind 5556.
+4. `sudo -v` on mjolnir so the launcher can start the IGMP querier. Without the querier the switch drops the
+   robot's DDS multicast ~4 min after the deploy subscribes and the deploy dies at `k` with
+   `LowState or IMUState is not available` (happened on the first run).
+5. Policy server up with the model you want:
+   ```bash
+   ssh darwin-gpu '~/serve_policy.sh best34'      # or v2; keeps running in tmux "policy"
+   ```
 
-**VLA gotchas (read before the first run):**
-- **`p` (pause) opens the hands after 2 s.** Pausing stops the action stream; `inspire_vla_bridge.py` treats >2 s without a fresh action as comms loss and commands both hands open (`--action-max-age`). A held bottle is dropped. Safety default, deliberate; to hold the last grasp instead run the bridge with `--action-max-age 1e9`.
-- **Frozen head view is rejected, not used.** If the g1 RTP push dies the sender keeps re-sending the last `head_view` JPEG; `run_vla_inference.py` drops observations whose views differ by >0.5 s (`MAX_VIEW_SKEW_S`) and logs `stale camera view(s)`. The policy then keeps replaying its last chunk until it runs out — pause (`p`) and fix the camera.
-- **Hands open on Ctrl-C / SIGTERM / Python crash of the bridge**, not on SIGKILL or power loss.
-- **Do not open-then-close PICO Remote Vision during a run**: `CLOSE_CAMERA` tears down the capture pipeline and the ZMQ tee with it. Keep the headset out of it (autostart) or leave the session open.
-- `install_scripts/install_inference.sh` is broken under uv (upstream too: dependency named `Isaac-GR00T`, package is `gr00t`). `.venv_inference` was built by hand; see memory/this section.
-- **`LowState or IMUState is not available` right after `k`, then `Planner initialization timeout`** (seen 2026-09-11 on the first VLA run): the IGMP querier was down. The launcher can only start it if sudo is cached — run `sudo -v` BEFORE `tools/vla-inference.sh up`, or start it by hand: `sudo nohup python3 ~/igmp_querier.py >/tmp/igmp.log 2>&1 &`. Lowstate itself was fine (`~/eval_vla/lowstate_check.py enP2p1s0` → ~1 kHz); the switch prunes the multicast ~4 min after the deploy subscribes, so `Init Done` → `k` must also not wait longer than that without the querier. Restart the deploy from the container prompt with `./run_sonic.sh`.
+### Run
+
+```bash
+sudo -v
+~/GR00T-WholeBodyControl/tools/vla-inference.sh up      # PROMPT="..." HANDS=0 POLICY_MODEL=... overrides
+tmux attach -t vla
+```
+
+Window `run` (the one you land in), panes:
+
+```
+ ┌───────────────────────────┬───────────────────────────┐
+ │ deploy (container)        │ inference                 │
+ │ Init Done / O = e-stop    │ run_vla_inference.py      │
+ ├───────────────────────────┼───────────────────────────┤
+ │ keys  ← type here         │ hands (Inspire bridge)    │
+ └───────────────────────────┴───────────────────────────┘
+```
+Move between panes with `Ctrl-b` + arrow. Window `svc` (`Ctrl-b n`): tunnel, cam-g1, cam-sender.
+
+**Type only in the keys pane.** The deploy pane reads keystrokes too: `Enter` toggles ZMQ streaming,
+`o` stops, `i` re-initialises — and arrow keys in the keys pane insert `^[[A` garbage (`Ctrl-U` clears
+the line).
+
+Then, in order:
+
+| step | do | expect |
+|---|---|---|
+| 1 | wait | deploy pane: `Init Done`. inference pane: `PolicyServer is reachable`, `Policy video keys … ['head_view', 'ego_view']`, `Hand state source: Inspire bridge`, then image-latency lines for **both** views and `waiting for state msg` (normal until step 2). hands pane: `InspireL/InspireR: rest pose …`, `[VLAHands] running`. |
+| 2 | keys: `k` ⏎ | deploy: `Planner enabled` then no timeout; the robot comes under power and stands under the planner (hoist!). inference: `New action chunk (… latency 0.2–0.3 s)` lines start (policy still paused). |
+| 3 | keys: `i` ⏎ | robot blends (1 s) to the initial pose taken from our demonstrations. |
+| 4 | keys: `p` ⏎ | policy drives the robot. `p` again pauses (see gotchas), `x` stops the C++ loop, `t <text>` changes the prompt — **keep the training prompt** `put bottles with red cap in red bottle holder`. |
+
+E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer were running — it is not).
+
+### Stop
+
+```bash
+~/GR00T-WholeBodyControl/tools/vla-inference.sh down    # kills session, inference, bridge (opens hands), sender, deploy, g1 push
+```
+The policy server on darwin-gpu keeps running; stop it with `ssh darwin-gpu 'tmux kill-session -t policy'`.
+
+### Gotchas
+
+- **`p` (pause) opens the hands after 2 s.** No actions for >2 s = comms loss for the bridge → both hands open
+  (`--action-max-age`). A held bottle is dropped. Deliberate safety default; `--action-max-age 1e9` holds the last grasp.
+- **Frozen head view is rejected.** If the g1 push dies the sender re-sends the last `head_view`; observations whose
+  views differ by >0.5 s are dropped (`MAX_VIEW_SKEW_S`, log `stale camera view(s)`) and the robot replays its last
+  chunk until it runs out — pause (`p`), fix the camera.
+- **Hands open on Ctrl-C / SIGTERM / crash of the bridge**, not on SIGKILL or power loss.
+- **Do not open-then-close PICO Remote Vision during a run**: `CLOSE_CAMERA` tears down the capture pipeline and
+  the ZMQ tee with it. Either keep the headset out of it (`--autostart`) or leave the session open.
+- **`k` always STARTs, `x` STOPs.** The upstream `k` toggle relied on the client's own memory; after a deploy
+  restart it sent STOP for START and the deploy quit (second run, 2026-09-11).
+- **Deploy died at `k` with `LowState or IMUState is not available` → `Planner initialization timeout`**: IGMP
+  querier down (see "Before you start"). Lowstate itself: `~/eval_vla/lowstate_check.py enP2p1s0` → ~1 kHz.
+  Restart the deploy from the container prompt with `./run_sonic.sh`.
+- **`Address already in use 5550` on darwin-gpu**: a previous server is still on the port; `serve_policy.sh`
+  now stops it, or `tmux kill-session -t policy`.
+- `install_scripts/install_inference.sh` is broken under uv (upstream too: dependency named `Isaac-GR00T`, package is
+  `gr00t`); `.venv_inference` was built by hand (gear_sonic + pyzmq msgpack msgpack-numpy pin tyro opencv scipy
+  pymodbus==3.13.1) and `run_vla_inference.py` falls back to the vendored `gear_sonic/utils/inference/gr00t_client.py`.
+
+### Status (2026-09-11)
+
+Verified on hardware: both camera views at 30 Hz without a headset (skew ≤ 50 ms), hands close/open through the
+bridge per side, hand state published, policy round trip 0.25 s with a real two-camera observation, deploy →
+`Init Done` → `k` → `Planner enabled` after the querier fix. **Not yet verified:** the closed loop (`i`, `p`) —
+the first session ended before it. Known hardware quirks (also in the training data): right index finger reads
+closed at its open end-stop (0.25 closure at rest); index fingers stall at ~1/3 travel when closing.
