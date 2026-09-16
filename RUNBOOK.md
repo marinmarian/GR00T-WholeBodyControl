@@ -446,10 +446,25 @@ The policy server on darwin-gpu keeps running; stop it with `ssh darwin-gpu 'tmu
   `gr00t`); `.venv_inference` was built by hand (gear_sonic + pyzmq msgpack msgpack-numpy pin tyro opencv scipy
   pymodbus==3.13.1) and `run_vla_inference.py` falls back to the vendored `gear_sonic/utils/inference/gr00t_client.py`.
 
-### Status (2026-09-11)
+- **Head camera gone: inference pane says `camera message lacks ['head_view']`.** The D430i has dropped off g1's USB
+  bus (`ssh g1 lsusb` shows no `8086:0b4b`, `/dev/v4l/by-id` empty). Unplug it at the robot, count to 10, replug; then
+  restart the push in the `svc` cam-g1 pane. **Press `p` first if the C++ loop is running** — the policy resumes acting
+  the instant observations become valid again (2026-09-11: the robot started moving unprompted when the camera came back).
+- **Wrist motors overheat during long hovers.** The policy tends to hold the bottle raised at full reach; the wrist
+  motors heat up and fault before placement. `f` in the deploy pane prints motor temperatures — check before each run,
+  let the wrists cool between attempts, don't restart while hot.
+- **Policy round trip 0.4–0.5 s in the real runs** (bench: 0.25 s): two raw 640x480 frames per request through the
+  office uplink. Sending JPEGs is the planned fix; until then expect hesitant motion.
+
+### Status (2026-09-16)
+
+**Closed loop verified on the real robot (2026-09-11, 8 attempts, both checkpoints).** Approach and grasp of the
+red-capped bottle work almost every time, including with a Fanta distractor; placement does not yet — the robot hovers
+with the bottle raised and the wrist motors overheat and fault first. Details, videos and next steps:
+`docs/EXPERIMENTS.md`. Datasets, checkpoints and videos are archived in `s3://darwin-robot-data` (`docs/DATA_AND_MODELS.md`).
 
 Verified on hardware: both camera views at 30 Hz without a headset (skew ≤ 50 ms), hands close/open through the
-bridge per side, hand state published, policy round trip 0.25 s with a real two-camera observation, deploy →
-`Init Done` → `k` → `Planner enabled` after the querier fix. **Not yet verified:** the closed loop (`i`, `p`) —
-the first session ended before it. Known hardware quirks (also in the training data): right index finger reads
-closed at its open end-stop (0.25 closure at rest); index fingers stall at ~1/3 travel when closing.
+bridge per side, hand state published, policy round trip 0.25 s on the bench / 0.4–0.5 s in the runs, deploy →
+`Init Done` → `k` → `Planner enabled` → `i` → `p` → autonomous motion. Known hardware quirks (also in the training
+data): right index finger reads closed at its open end-stop (0.25 closure at rest); index fingers stall at ~1/3 travel
+when closing.
