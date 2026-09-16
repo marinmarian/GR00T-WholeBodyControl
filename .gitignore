@@ -225,3 +225,9 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+
+# local-only artifacts of the mjolnir rig (weights, TensorRT engines, nested checkouts, tooling state)
+gear_sonic_deploy/policy/low_latency/
+gear_sonic_deploy/policy/sonic_v1_1/
+gear_sonic_deploy/docker/nvidia-cuda-build/
+.claude/
