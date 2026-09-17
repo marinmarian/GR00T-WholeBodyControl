@@ -6,6 +6,12 @@ broken. Machine names: **mjolnir** = Jetson Thor backpack (`192.168.123.222`,
 hotspot AP `10.42.0.1`), **g1** = robot's onboard Orin Nano
 (`192.168.123.164`, ssh alias `g1`), robot low-level = `192.168.123.161`.
 
+This fork is the working checkout on mjolnir. The team's canonical copy of this runbook and the project docs live in
+**[prosus-robotics/g1-vr-teleop](https://github.com/prosus-robotics/g1-vr-teleop)** (an overlay of the same files):
+experiment log `docs/EXPERIMENTS.md`, dataset/checkpoint registry `docs/DATA_AND_MODELS.md`, and the work tracked in
+two milestones — [Bartending demo, AI House (Aug 2026)](https://github.com/prosus-robotics/g1-vr-teleop/milestone/2)
+(closed) and [Restocking VLA: from first closed loop to reliable placement](https://github.com/prosus-robotics/g1-vr-teleop/milestone/1) (open).
+
 ## System map
 
 | piece | runs on | notes |
@@ -461,7 +467,10 @@ The policy server on darwin-gpu keeps running; stop it with `ssh darwin-gpu 'tmu
 **Closed loop verified on the real robot (2026-09-11, 8 attempts, both checkpoints).** Approach and grasp of the
 red-capped bottle work almost every time, including with a Fanta distractor; placement does not yet — the robot hovers
 with the bottle raised and the wrist motors overheat and fault first. Details, videos and next steps:
-`docs/EXPERIMENTS.md`. Datasets, checkpoints and videos are archived in `s3://darwin-robot-data` (`docs/DATA_AND_MODELS.md`).
+[`docs/EXPERIMENTS.md`](https://github.com/prosus-robotics/g1-vr-teleop/blob/main/docs/EXPERIMENTS.md) in g1-vr-teleop. Datasets,
+checkpoints and videos are archived in `s3://darwin-robot-data`
+([`docs/DATA_AND_MODELS.md`](https://github.com/prosus-robotics/g1-vr-teleop/blob/main/docs/DATA_AND_MODELS.md)). Open follow-ups:
+[milestone 1](https://github.com/prosus-robotics/g1-vr-teleop/milestone/1) (#18–#21, #23, #25–#30 there).
 
 Verified on hardware: both camera views at 30 Hz without a headset (skew ≤ 50 ms), hands close/open through the
 bridge per side, hand state published, policy round trip 0.25 s on the bench / 0.4–0.5 s in the runs, deploy →
