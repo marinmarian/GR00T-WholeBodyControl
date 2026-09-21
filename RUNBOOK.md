@@ -442,8 +442,14 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
 - **`p` (pause) opens the hands after 2 s.** No actions for >2 s = comms loss for the bridge → both hands open
   (`--action-max-age`). A held bottle is dropped. Deliberate safety default; `--action-max-age 1e9` holds the last grasp.
 - **Frozen head view is rejected.** If the g1 push dies the sender re-sends the last `head_view`; observations whose
-  views differ by >0.5 s are dropped (`MAX_VIEW_SKEW_S`, log `stale camera view(s)`) and the robot replays its last
-  chunk until it runs out — pause (`p`), fix the camera.
+  views differ by >0.5 s are dropped (`MAX_VIEW_SKEW_S`, log `stale camera view(s)`).
+- **Sensor loss pauses the policy by itself** (since 2026-09-21, `--sensor-loss-pause-s`, default 1 s): after 1 s
+  without a valid observation (a view missing or stale, or no robot state) the inference pane prints a red
+  `SENSOR LOSS … policy PAUSED` line, stops sending actions and stays paused until you press `p` — it no longer
+  resumes when the sensor comes back (it did on 2026-09-11 and the robot moved unprompted). Same consequence as a
+  manual `p`: the Inspire bridge opens the hands 2 s later, so a carried bottle is dropped. When the sensor is back
+  the pane prints `Observations valid again - policy still PAUSED`; then `p`. `--auto-resume-after-sensor-loss`
+  restores the old behaviour, don't.
 - **Hands open on Ctrl-C / SIGTERM / crash of the bridge**, not on SIGKILL or power loss.
 - **Do not open-then-close PICO Remote Vision during a run**: `CLOSE_CAMERA` tears down the capture pipeline and
   the ZMQ tee with it. Either keep the headset out of it (`--autostart`) or leave the session open.
@@ -468,10 +474,11 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
   `gr00t`); `.venv_inference` was built by hand (gear_sonic + pyzmq msgpack msgpack-numpy pin tyro opencv scipy
   pymodbus==3.13.1) and `run_vla_inference.py` falls back to the vendored `gear_sonic/utils/inference/gr00t_client.py`.
 
-- **Head camera gone: inference pane says `camera message lacks ['head_view']`.** The D430i has dropped off g1's USB
-  bus (`ssh g1 lsusb` shows no `8086:0b4b`, `/dev/v4l/by-id` empty). Unplug it at the robot, count to 10, replug; then
-  restart the push in the `svc` cam-g1 pane. **Press `p` first if the C++ loop is running** — the policy resumes acting
-  the instant observations become valid again (2026-09-11: the robot started moving unprompted when the camera came back).
+- **Head camera gone: inference pane says `camera message lacks ['head_view']`, then `SENSOR LOSS … PAUSED`.** The
+  D430i has dropped off g1's USB bus (`ssh g1 lsusb` shows no `8086:0b4b`, `/dev/v4l/by-id` empty); the `svc` cam-g1 pane
+  says `head camera device missing`. Unplug it at the robot, count to 10, replug. The cam-g1 pane restarts the push on
+  its own (watchdog loop on g1, since 2026-09-21), the inference pane reports `Observations valid again`, and only
+  your `p` resumes the policy. Check the picture is live (image-latency lines for both views) before pressing it.
 - **Wrist motors overheat during long hovers.** The policy tends to hold the bottle raised at full reach; the wrist
   motors heat up and fault before placement. `f` in the deploy pane prints motor temperatures — check before each run,
   let the wrists cool between attempts, don't restart while hot.
