@@ -357,16 +357,17 @@ deactivated/rotated — ask the account owner.
 
 ## VLA inference (GR00T N1.7 restocking policy)
 
-Runs the fine-tuned GR00T N1.7 policy on the real G1: the policy server on the EC2 GPU box
-(`darwin-gpu`), everything else on mjolnir. Same SONIC deploy, cameras and Inspire hands as
-teleop; `run_vla_inference.py` takes the PICO streamer's place on ZMQ 5556/5557.
+Runs the fine-tuned GR00T N1.7 policy on the real G1. Since 2026-09-21 **everything runs on mjolnir**,
+policy server included (`POLICY_MODE=local`, the default); the EC2 GPU box (`darwin-gpu`) behind an SSH tunnel
+is the fallback (`POLICY_MODE=ec2`). Same SONIC deploy, cameras and Inspire hands as teleop;
+`run_vla_inference.py` takes the PICO streamer's place on ZMQ 5556/5557.
 
 ### What runs where
 
 | piece | where | notes |
 |---|---|---|
-| PolicyServer (Isaac-GR00T) | darwin-gpu, tmux `policy` | `~/serve_policy.sh v2\|best34` (stops a previous server on the port itself). Checkpoints `~/checkpoints/restocking_{v2,best34}/…/checkpoint-10000`. Always passes the two-camera modality config. |
-| SSH tunnel to 5550 | mjolnir, `vla` session, `svc` window | EC2 does not open 5550; mjolnir's ed25519 key is authorised on darwin-gpu. RTT ~10 ms, one inference ≈ 0.25 s (budget 0.4 s at 2.5 Hz). |
+| PolicyServer (Isaac-GR00T), **local** | mjolnir, `vla` session, `svc` window, pane `serve` | `~/g1-vr-teleop/rig/thor/serve_policy.sh best34\|v2` on `127.0.0.1:5550`, started by the launcher. Thor venv from `rig/thor/install_thor.sh` (Isaac-GR00T @ `51d4c89`, JetPack 7.1 / CUDA 13.0 stack), checkpoints `~/checkpoints/restocking_{best34,v2}/checkpoint-10000` (from S3, `rig/thor/s3_pull_checkpoints.py`). Loads ~12 GB, takes ~1 min (56 s measured; the very first start also downloads the 4.6 GB Cosmos backbone from HF, ~10 min) to come up. Bench 2026-09-21: 145 ms median / 165 ms p95 per 40-step chunk in-process, 0.15–0.17 s round trip over loopback (first call after start 0.77 s warm-up), 6 GiB GPU. |
+| PolicyServer, **EC2 fallback** | darwin-gpu, tmux `policy` + SSH tunnel to 5550 from the `svc` window | `POLICY_MODE=ec2 tools/vla-inference.sh up` and `ssh darwin-gpu '~/serve_policy.sh v2\|best34'` yourself. EC2 does not open 5550; mjolnir's ed25519 key is authorised there. 0.25 s per inference on the bench, 0.40–0.54 s in the runs (two raw frames through the office uplink). |
 | head-IR push | g1 → mjolnir udp 5600/5601 | started automatically once g1 answers ping |
 | camera sender | mjolnir, `svc` window | teleop command **+ `--autostart`**: capture and the ZMQ 5555 tee run without a PICO Remote Vision session. `ego_view` = OBSBOT side view, `head_view` = D430i IR. |
 | C++ deploy | mjolnir, `run` window, `g1-deploy-dev` container | `./run_sonic.sh` = the teleop command (`--input-type zmq_manager --output-type all`). |
@@ -384,16 +385,19 @@ teleop; `run_vla_inference.py` takes the PICO streamer's place on ZMQ 5556/5557.
 4. `sudo -v` on mjolnir so the launcher can start the IGMP querier. Without the querier the switch drops the
    robot's DDS multicast ~4 min after the deploy subscribes and the deploy dies at `k` with
    `LowState or IMUState is not available` (happened on the first run).
-5. Policy server up with the model you want:
+5. Policy server: nothing to do in local mode — the launcher starts it (`POLICY_MODEL=best34` default, `v2` the other
+   one) and the inference pane waits until it listens. First time on a freshly set-up mjolnir: `rig/thor/README.md`
+   (install, checkpoint pull, HF token). EC2 fallback only:
    ```bash
    ssh darwin-gpu '~/serve_policy.sh best34'      # or v2; keeps running in tmux "policy"
+   POLICY_MODE=ec2 ~/GR00T-WholeBodyControl/tools/vla-inference.sh up
    ```
 
 ### Run
 
 ```bash
 sudo -v
-~/GR00T-WholeBodyControl/tools/vla-inference.sh up      # PROMPT="..." HANDS=0 POLICY_MODEL=... overrides
+~/GR00T-WholeBodyControl/tools/vla-inference.sh up      # POLICY_MODEL=v2 POLICY_MODE=ec2 PROMPT="..." HANDS=0 overrides
 tmux attach -t vla
 ```
 
@@ -407,7 +411,8 @@ Window `run` (the one you land in), panes:
  │ keys  ← type here         │ hands (Inspire bridge)    │
  └───────────────────────────┴───────────────────────────┘
 ```
-Move between panes with `Ctrl-b` + arrow. Window `svc` (`Ctrl-b n`): tunnel, cam-g1, cam-sender.
+Move between panes with `Ctrl-b` + arrow. Window `svc` (`Ctrl-b n`): serve (local policy server; tunnel in ec2 mode),
+cam-g1, cam-sender.
 
 **Type only in the keys pane.** The deploy pane reads keystrokes too: `Enter` toggles ZMQ streaming,
 `o` stops, `i` re-initialises — and arrow keys in the keys pane insert `^[[A` garbage (`Ctrl-U` clears
@@ -417,7 +422,7 @@ Then, in order:
 
 | step | do | expect |
 |---|---|---|
-| 1 | wait | deploy pane: `Init Done`. inference pane: `PolicyServer is reachable`, `Policy video keys … ['head_view', 'ego_view']`, `Hand state source: Inspire bridge`, then image-latency lines for **both** views and `waiting for state msg` (normal until step 2). hands pane: `InspireL/InspireR: rest pose …`, `[VLAHands] running`. |
+| 1 | wait | serve pane (svc window): model loading, then the ZMQ bind. deploy pane: `Init Done`. inference pane: `waiting for policy server on :5550 ...` until the server is up, then `PolicyServer is reachable`, `Policy video keys … ['head_view', 'ego_view']`, `Hand state source: Inspire bridge`, then image-latency lines for **both** views and `waiting for state msg` (normal until step 2). hands pane: `InspireL/InspireR: rest pose …`, `[VLAHands] running`. |
 | 2 | keys: `k` ⏎ | deploy: `Planner enabled` then no timeout; the robot comes under power and stands under the planner (hoist!). inference: `New action chunk (… latency 0.2–0.3 s)` lines start (policy still paused). |
 | 3 | keys: `i` ⏎ | robot blends (1 s) to the initial pose taken from our demonstrations. |
 | 4 | keys: `p` ⏎ | policy drives the robot. `p` again pauses (see gotchas), `x` stops the C++ loop, `t <text>` changes the prompt — **keep the training prompt** `put bottles with red cap in red bottle holder`. |
@@ -429,7 +434,8 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
 ```bash
 ~/GR00T-WholeBodyControl/tools/vla-inference.sh down    # kills session, inference, bridge (opens hands), sender, deploy, g1 push
 ```
-The policy server on darwin-gpu keeps running; stop it with `ssh darwin-gpu 'tmux kill-session -t policy'`.
+`down` also kills the local policy server. In ec2 mode the server on darwin-gpu keeps running; stop it with
+`ssh darwin-gpu 'tmux kill-session -t policy'`.
 
 ### Gotchas
 
@@ -446,8 +452,16 @@ The policy server on darwin-gpu keeps running; stop it with `ssh darwin-gpu 'tmu
 - **Deploy died at `k` with `LowState or IMUState is not available` → `Planner initialization timeout`**: IGMP
   querier down (see "Before you start"). Lowstate itself: `~/eval_vla/lowstate_check.py enP2p1s0` → ~1 kHz.
   Restart the deploy from the container prompt with `./run_sonic.sh`.
-- **`Address already in use 5550` on darwin-gpu**: a previous server is still on the port; `serve_policy.sh`
-  now stops it, or `tmux kill-session -t policy`.
+- **`Address already in use 5550`**: a previous server is still on the port; both `serve_policy.sh` (Thor and darwin-gpu)
+  stop it first, `vla-inference.sh up` kills a stale local server, or `tmux kill-session -t policy` on darwin-gpu.
+- **Inference pane started before the server → `Policy video keys` missing / single `ego_view`.** `run_vla_inference.py`
+  asks the server for its camera keys once at start-up and silently falls back to `ego_view` only. The launcher now
+  waits for the port; if you start the client by hand, start it after the server listens.
+- **Local server: never `uv run`/`uv sync` in `~/Isaac-GR00T`.** Its root pyproject targets x86_64 cu128 and would
+  replace the Thor venv. `source ~/g1-vr-teleop/rig/thor/env.sh` and use plain `python` (the scripts do).
+- **Local server and the C++ deploy share the Thor GPU.** Memory is not the issue (122 GB unified); controller jitter
+  would be. Before the first real run with the local server, do the on-hoist check: C++ loop running (`k`), then
+  `rig/thor/bench_policy.py` in another shell, watch the deploy pane for timing warnings.
 - `install_scripts/install_inference.sh` is broken under uv (upstream too: dependency named `Isaac-GR00T`, package is
   `gr00t`); `.venv_inference` was built by hand (gear_sonic + pyzmq msgpack msgpack-numpy pin tyro opencv scipy
   pymodbus==3.13.1) and `run_vla_inference.py` falls back to the vendored `gear_sonic/utils/inference/gr00t_client.py`.
