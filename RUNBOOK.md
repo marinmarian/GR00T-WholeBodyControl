@@ -63,6 +63,26 @@ tmux attach -t sonic
   (4+ are squat/kneel/lying/boxing/jump stunts that fight the hoist).
 - Stop: `O` in deploy pane / `A+B+X+Y` / `L2+B` damp.
 
+### Hand tracking instead of triggers (experimental, 2026-09-21, issue #35)
+
+`INSPIRE_HANDS=handtracking ~/sonic-teleop.sh up` makes the Inspire hands follow your fingers instead
+of the triggers: mean finger curl → four-finger close, thumb curl → thumb bend (same bridge, same
+force logic, same recorded hand state). Everything else stays on the controllers: `A+X` mode toggle,
+`A+B+X+Y` e-stop, gaits, sticks, recording gestures — the streamer has no keyboard control, so
+**keep the controllers within reach**; `O` in the deploy pane still works from the keyboard.
+
+- PICO app: enable hand tracking in the XRoboToolkit app and put the controllers down; the headset
+  switches to hands on its own. A hand that is not tracked (out of view, controller picked up) holds
+  its last pose for 0.5 s, then follows that side's controller trigger/grip again.
+- First time / after headset updates, run the probe with the teleop **down** and the xr-service up:
+  `cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && python tools/hand_tracking_probe.py`
+  (curl one finger at a time, check the matching column moves; fist → trigger 1.00; watch `body=`
+  and the wrist positions with controllers down — arm tracking comes from the body tracker).
+- `HAND_TRACKING_DEBUG=1` prints once a second whether each side is driven by `hand`, `hold` or
+  `controller`. Tuning constants (`FINGER_OPEN_DEG` …) live in `gear_sonic/utils/teleop/hand_tracking.py`.
+- Not yet validated on the headset (2026-09-21): joint order, whether controllers and hands stream
+  at the same time, and whether body tracking survives without controllers are the open questions.
+
 ### Recording (PICO controller or KEYS pane)
 The script runs the **ZMQ exporter** (`gear_sonic/scripts/run_data_exporter.py`)
 by default. `EXPORTER=ros2` selects the older ROS 2 exporter, which does not work

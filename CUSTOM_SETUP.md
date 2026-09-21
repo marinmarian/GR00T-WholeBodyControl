@@ -77,6 +77,11 @@ This package drives them **independently** of the body pipeline, over Modbus TCP
 - `test_hands.py` — standalone connectivity check (`--cycle` opens/closes both hands).
 
 Enable in the streamer with `--inspire-hands trigger`. This rig: `TRACKED_HANDS=right`.
+`--inspire-hands handtracking` (2026-09-21, #35) feeds the same bridge from the PICO hand
+tracking: `gear_sonic/utils/teleop/hand_tracking.py` turns the 26 OpenXR joints into a virtual
+trigger (mean finger curl from bone angles) and grip (thumb curl), with EMA smoothing, a 0.5 s
+hold on tracking loss and controller fallback per side. Buttons and sticks stay on the controllers.
+Probe: `tools/hand_tracking_probe.py`; tests: `tools/tests/test_hand_tracking.py`.
 Leftover process: `pgrep -af pico_vive_bridge` then `kill PID` (ports 5555/5556/5558);
 do not kill the XR service. Dual-hand sequential Modbus cannot hold 90 Hz.
 It runs alongside the (inert, Dex3) deploy output; for the decoupled_wbc pipeline
