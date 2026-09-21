@@ -423,7 +423,7 @@ Then, in order:
 | step | do | expect |
 |---|---|---|
 | 1 | wait | serve pane (svc window): model loading, then the ZMQ bind. deploy pane: `Init Done`. inference pane: `waiting for policy server on :5550 ...` until the server is up, then `PolicyServer is reachable`, `Policy video keys … ['head_view', 'ego_view']`, `Hand state source: Inspire bridge`, then image-latency lines for **both** views and `waiting for state msg` (normal until step 2). hands pane: `InspireL/InspireR: rest pose …`, `[VLAHands] running`. |
-| 2 | keys: `k` ⏎ | deploy: `Planner enabled` then no timeout; the robot comes under power and stands under the planner (hoist!). inference: `New action chunk (… latency 0.2–0.3 s)` lines start (policy still paused). |
+| 2 | keys: `k` ⏎ | deploy: `Planner enabled` then no timeout; the robot comes under power and stands under the planner (hoist!). inference: `New action chunk (… latency …)` lines start (policy still paused) — expect ~0.15 s with the local server, 0.4–0.5 s via EC2. |
 | 3 | keys: `i` ⏎ | robot blends (1 s) to the initial pose taken from our demonstrations. |
 | 4 | keys: `p` ⏎ | policy drives the robot. `p` again pauses (see gotchas), `x` stops the C++ loop, `t <text>` changes the prompt — **keep the training prompt** `put bottles with red cap in red bottle holder`. |
 
@@ -460,8 +460,10 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
 - **Local server: never `uv run`/`uv sync` in `~/Isaac-GR00T`.** Its root pyproject targets x86_64 cu128 and would
   replace the Thor venv. `source ~/g1-vr-teleop/rig/thor/env.sh` and use plain `python` (the scripts do).
 - **Local server and the C++ deploy share the Thor GPU.** Memory is not the issue (122 GB unified); controller jitter
-  would be. Before the first real run with the local server, do the on-hoist check: C++ loop running (`k`), then
-  `rig/thor/bench_policy.py` in another shell, watch the deploy pane for timing warnings.
+  would be. The check is the normal flow, nothing extra: `up`, wait for the serve pane to listen and `Init Done`, `k`.
+  The client now requests a chunk every 0.4 s while the policy is still paused (step 2), so the GPU load is real —
+  watch the deploy pane's timing lines (LowState age, policy, motor command) for a minute before `i`/`p`. Do not run
+  `bench_policy.py` next to a live loop: it loads a second copy of the model.
 - `install_scripts/install_inference.sh` is broken under uv (upstream too: dependency named `Isaac-GR00T`, package is
   `gr00t`); `.venv_inference` was built by hand (gear_sonic + pyzmq msgpack msgpack-numpy pin tyro opencv scipy
   pymodbus==3.13.1) and `run_vla_inference.py` falls back to the vendored `gear_sonic/utils/inference/gr00t_client.py`.
