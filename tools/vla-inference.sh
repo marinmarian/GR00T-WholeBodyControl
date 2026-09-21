@@ -8,6 +8,9 @@
 #
 # Layout:  window "svc": serve (local policy server) or tunnel | cam-g1 (head IR push) | cam-sender (OBSBOT + head, --autostart, ZMQ 5555)
 #          window "run": deploy (C++ SONIC, container) | inference (run_vla_inference) | hands (Inspire) | keys
+# Safety: the inference client pauses itself after 1 s without a valid observation (camera view missing/stale,
+#         no robot state) and stays paused until you press p again (--sensor-loss-pause-s, #26). The cam-g1 pane
+#         restarts the head push on its own when the camera comes back.
 # Operator sequence (all in window "run"):
 #   1. deploy pane: wait for "Init Done" (robot on the hoist; O = e-stop there).
 #   2. inference pane: it waits for the policy server (local model load ~1-2 min), then prints
@@ -28,7 +31,15 @@ GPU_HOST="${GPU_HOST:-ubuntu@13.40.142.104}"          # darwin-gpu (EC2). Port 5
 TUNNEL_CMD="while true; do ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:${POLICY_PORT}:127.0.0.1:5550 ${GPU_HOST}; echo 'tunnel dropped, retrying in 3s'; sleep 3; done"
 CAM_COLOR=/dev/v4l/by-id/usb-Remo_Tech_Co.__Ltd._OBSBOT_Tiny_2_Lite-video-index0
 CAM_G1=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_Intel_R__RealSense_TM__Depth_Camera_430i_349623061587-video-index2
-CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"'
+GST_G1="gst-launch-1.0 v4l2src device=$CAM_G1 ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"
+# Head-camera watchdog (issue #26): runs ON g1 inside one ssh session. Waits for the D430i device node, starts
+# the push, and restarts it when it exits or the camera drops off the USB bus. Safe now because the VLA client
+# pauses itself after 1 s without a valid observation and stays paused until 'p' (it used to resume unprompted).
+# -tt gives the remote loop a pty so killing the pane hangs it up; up/down also pkill the HEADCAM_WATCHDOG marker.
+headcam_push_cmd() {   # $1 device node, $2 gst pipeline  -> remote bash command (no single quotes inside)
+  echo "HEADCAM_WATCHDOG=1; while true; do until [ -e $1 ]; do echo \"[\$(date +%T)] head camera device missing - D430i off the USB bus? unplug 10 s, replug\"; sleep 2; done; echo \"[\$(date +%T)] head camera present, starting push\"; $2; echo \"[\$(date +%T)] head push exited, retrying in 2 s (VLA client pauses itself on sensor loss; press p to resume)\"; sleep 2; done"
+}
+CAMG1_CMD="ssh -tt g1 '$(headcam_push_cmd "$CAM_G1" "$GST_G1")'"
 # --autostart: capture + ZMQ tee run without a PICO Remote Vision session (headset optional).
 CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt MJPG --width 1280 --height 720 --fps 30 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555 --autostart'
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
@@ -60,7 +71,7 @@ up)
   pkill -f "run_vla_inferenc[e]" 2>/dev/null
   pkill -f "inspire_vla_bridg[e]" 2>/dev/null
   pkill -f "g1_deploy_onnx_re[f]" 2>/dev/null
-  ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
+  ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "HEADCAM_WATCHDO[G]"; pkill -f "gst-launc[h]"' 2>/dev/null
   tmux kill-session -t vla-tunnel 2>/dev/null
   pkill -f "run_gr00t_serve[r].py" 2>/dev/null           # stale local policy server would hold 5550
   sleep 1
@@ -104,7 +115,7 @@ down)
   pkill -f "inspire_vla_bridg[e]" 2>/dev/null           # its stop() opens the hands
   pkill -f "OrinVideoSenderI[R]" 2>/dev/null
   pkill -f "g1_deploy_onnx_re[f]" 2>/dev/null
-  ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
+  ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "HEADCAM_WATCHDO[G]"; pkill -f "gst-launc[h]"' 2>/dev/null
   echo "vla session down"
   ;;
 status)
