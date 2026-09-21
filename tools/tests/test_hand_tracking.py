@@ -8,7 +8,8 @@ from gear_sonic.utils.teleop import hand_tracking as ht
 
 
 def synth_hand(finger_flex_deg=0.0, thumb_flex_deg=0.0, scale=1.0):
-    """26x7 joint array of a hand whose finger joints each bend by finger_flex_deg (per joint)."""
+    """26x7 joint array of a hand whose finger joints each bend by finger_flex_deg (per joint).
+    finger_flex_deg may be a dict {index|middle|ring|little: deg} for per-finger poses."""
     j = np.zeros((26, 7)); j[:, 6] = 1.0
     j[ht.WRIST, :3] = (0, 0, 0)
     j[ht.PALM, :3] = (0.04, 0, 0)
@@ -25,7 +26,8 @@ def synth_hand(finger_flex_deg=0.0, thumb_flex_deg=0.0, scale=1.0):
 
     for k, (name, idx) in enumerate(ht.FINGERS.items()):
         base = (0.03, 0.02 - 0.013 * k, 0)
-        pts = chain(base, (1, 0), [0.05, 0.04, 0.025, 0.02], finger_flex_deg)   # meta, prox, inter, dist, tip
+        flex = finger_flex_deg.get(name, 0.0) if isinstance(finger_flex_deg, dict) else finger_flex_deg
+        pts = chain(base, (1, 0), [0.05, 0.04, 0.025, 0.02], flex)   # meta, prox, inter, dist, tip
         for jj, p in zip(idx, pts):
             j[jj, :3] = p
     pts = chain((0.01, 0.03, 0), (0.7, 0.7), [0.04, 0.03, 0.025], thumb_flex_deg)  # meta, prox, dist, tip
@@ -85,4 +87,27 @@ assert abs(prov3()[1] - 0.5) < 1e-9
 assert abs(prov3()[1] - 0.75) < 1e-9
 assert abs(prov3()[1] - 0.875) < 1e-9   # still below SNAP_HIGH
 assert prov3()[1] == 1.0                  # 0.9375 >= SNAP_HIGH -> snapped to 1.0
+
+# ---- per-finger targets (phase 2): only the index bent -> only the index DOF closes
+one = synth_hand({"index": 70}, 0)
+c = ht.hand_curls(one); assert c["index"] == 1.0 and c["middle"] == 0.0 and c["little"] == 0.0, c
+st = {"hand": one}
+p4 = ht.HandTrackingInputs(lambda: (False, 0, 0, 0, 0), lambda s: (st["hand"], 1), alpha=1.0, clock=lambda: 0.0)
+p4()
+ft = p4.finger_targets()
+assert ft["left"] == [0.0, 0.0, 0.0, 1.0, 0.0, None], ft          # [little, ring, middle, index, thumb_bend, thumb_rot]
+assert ft["right"] == [0.0, 0.0, 0.0, 1.0, 0.0, None]
+# side on its controller -> None (bridge falls back to trigger mapping)
+p5 = ht.HandTrackingInputs(lambda: (False, 0.3, 0, 0, 0), lambda s: (np.zeros((26, 7)), 0), clock=lambda: 0.0)
+p5(); assert p5.finger_targets() == {"left": None, "right": None}
+# bridge mapping of closures -> angles, and per-finger force rule (pure static methods)
+from gear_sonic.utils.teleop.inspire import inspire_bridge as ib
+ang = ib.InspireBridge._targets_from_closures([0.0, 0.0, 0.0, 1.0, 0.5, None])
+assert ang == [ib.OPEN, ib.OPEN, ib.OPEN, 0, ib.OPEN * 0.5, ib.THUMB_ROT_REST], ang
+base = [100] * 6
+lim = ib.InspireBridge._force_set_for_inputs(base, 0.0, 0.0, closures=[0.0, 0.0, 0.0, 1.0, 0.0, None])
+cruise = ib.InspireBridge._force_set_from_baseline(base)
+assert lim[3] == ib.FORCE_SET_MAX_G and lim[0] == cruise[0] and lim[4] == cruise[4], lim
+lim2 = ib.InspireBridge._force_set_for_inputs(base, 1.0, 1.0)      # trigger path unchanged
+assert all(lim2[i] == ib.FORCE_SET_MAX_G for i in range(5)), lim2
 print("HAND_TRACKING_TEST_OK")

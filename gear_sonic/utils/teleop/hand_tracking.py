@@ -1,11 +1,11 @@
 """PICO hand tracking -> Inspire hand inputs (g1-vr-teleop #35).
 
-Phase 1: the tracked hand produces the same (menu, left_trigger, right_trigger, left_grip,
-right_grip) tuple the controllers produce, so the Inspire bridge, its force/stall logic, the
-dump publisher and the recorded hand-state space stay untouched:
-
-    trigger = curl of the four fingers (mean)      -> four-finger close in the bridge
-    grip    = curl of the thumb                     -> thumb bend in the bridge
+The tracked hand produces the same (menu, left_trigger, right_trigger, left_grip, right_grip)
+tuple the controllers produce (trigger = mean finger curl, grip = thumb closure), which keeps the
+hand IK for the ZMQ message and the recorded hand-state space untouched. Since phase 2 the
+Inspire bridge additionally gets PER-FINGER closures through ``finger_targets()``
+([little, ring, middle, index, thumb_bend, thumb_rot]), so each finger moves on its own;
+trigger/grip stay as the fallback mapping when a side is on its controller.
 
 Curl is computed from bone angles (flexion summed along the finger), which is scale-free and
 frame-free: no Unity->robot transform, no per-user calibration. Joint layout is OpenXR
@@ -140,6 +140,8 @@ class HandTrackingInputs:
         self._debug = debug
         self._clock = clock
         self._ema = {"left": None, "right": None}       # (trigger, grip)
+        # per-DOF closures in Inspire order [little, ring, middle, index, thumb_bend], smoothed
+        self._ema_dof = {"left": None, "right": None}
         self._last_valid = {"left": None, "right": None}
         self._source = {"left": "controller", "right": "controller"}
         self._diag = {"left": "", "right": ""}
@@ -175,6 +177,13 @@ class HandTrackingInputs:
             if self._debug:
                 self._diag[side] = f"read error {e}"
         if curls is not None:
+            dof = [curls["little"], curls["ring"], curls["middle"], curls["index"], curls["thumb"]]
+            prev_dof = self._ema_dof[side]
+            if prev_dof is None:
+                ema_dof = dof
+            else:
+                ema_dof = [prev_dof[i] + self._alpha * (dof[i] - prev_dof[i]) for i in range(5)]
+            self._ema_dof[side] = [1.0 if v >= SNAP_HIGH else (0.0 if v <= SNAP_LOW else v) for v in ema_dof]
             target = (curls["fingers"], curls["thumb"])
             prev = self._ema[side]
             if prev is None:
@@ -191,8 +200,20 @@ class HandTrackingInputs:
             self._source[side] = "hold"
             return self._ema[side]
         self._ema[side] = None
+        self._ema_dof[side] = None
         self._source[side] = "controller"
         return (float(ctrl_trigger), float(ctrl_grip))
+
+    def finger_targets(self):
+        """Per-DOF closures for the Inspire bridge: {"left": [little, ring, middle, index,
+        thumb_bend, thumb_rot] | None, "right": ...}. None while that side is on its controller
+        (the bridge then uses the trigger/grip mapping). thumb_rot is None (rest) for now.
+        Uses the values of the last __call__ (same tick as the trigger/grip it returned)."""
+        out = {}
+        for side in ("left", "right"):
+            d = self._ema_dof[side]
+            out[side] = None if (d is None or self._source[side] == "controller") else list(d) + [None]
+        return out
 
     def __call__(self):
         menu, lt, rt, lg, rg = self._controller_inputs()
