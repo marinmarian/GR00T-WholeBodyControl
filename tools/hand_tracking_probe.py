@@ -19,6 +19,8 @@ What to do while it runs:
   4. Make a fist: 'fingers' trigger must read 1.00. Open flat: 0.00. Note the raw sums for tuning.
   5. Watch 'body' and the wrist positions with controllers down: if they stop updating, arm
      tracking will not work in hand-tracking mode.
+  6. Pick the controllers back up: 'controllers moving' must return and btn= must show A/B/X/Y
+     when pressed. Note how long it takes -- the A+B+X+Y stop needs all four buttons visible.
 """
 import argparse, time
 import numpy as np
@@ -41,6 +43,12 @@ if a.synthetic:
         def get_right_trigger(self): return 0.0
         def get_left_grip(self): return 0.0
         def get_right_grip(self): return 0.0
+        def get_left_controller_pose(self): return np.zeros(7)
+        def get_right_controller_pose(self): return np.zeros(7)
+        def get_A_button(self): return False
+        def get_B_button(self): return False
+        def get_X_button(self): return False
+        def get_Y_button(self): return False
         def is_body_data_available(self): return False
         def get_body_joints_pose(self): return np.zeros((24, 7))
         def init(self): pass
@@ -51,6 +59,7 @@ else:
 
 xrt.init()
 print("SDK initialised. Ctrl+C to stop.", flush=True)
+prev_ctrl = (np.zeros(3), np.zeros(3))
 try:
     while True:
         rows = []
@@ -61,7 +70,8 @@ try:
             has_data = j.shape == (26, 7) and not np.allclose(j[:, :3], 0.0)
             sums = ht.raw_flexion_sums(j) if has_data else None
             curls = ht.hand_curls(j) if has_data else None
-            s = f"{side} active={active} data={'yes' if has_data else 'no '}"
+            nz = int(np.count_nonzero(np.any(np.abs(j[:, :3]) > 1e-9, axis=1))) if j.shape == (26, 7) else -1
+            s = f"{side} active={active} data={'yes' if has_data else 'no '}({nz:2d}/26)"
             if sums:
                 s += " sums(deg) " + " ".join(f"{k[:3]}={v:5.0f}" for k, v in sums.items())
             if curls:
@@ -69,7 +79,12 @@ try:
             if has_data:
                 w = j[ht.WRIST, :3]; s += f" wrist({w[0]:+.2f},{w[1]:+.2f},{w[2]:+.2f})"
             rows.append(s)
-        ctrl = (f"controllers: Ltrig {xrt.get_left_trigger():.2f} Lgrip {xrt.get_left_grip():.2f} "
+        lp = np.asarray(xrt.get_left_controller_pose(), dtype=np.float64)[:3]
+        rp = np.asarray(xrt.get_right_controller_pose(), dtype=np.float64)[:3]
+        moved = "moving" if (np.linalg.norm(lp - prev_ctrl[0]) + np.linalg.norm(rp - prev_ctrl[1])) > 1e-4 else "STILL "
+        prev_ctrl = (lp, rp)
+        btn = "".join(n for n, f in (("A", xrt.get_A_button), ("B", xrt.get_B_button), ("X", xrt.get_X_button), ("Y", xrt.get_Y_button)) if f()) or "-"
+        ctrl = (f"controllers {moved} btn={btn:4s} Ltrig {xrt.get_left_trigger():.2f} Lgrip {xrt.get_left_grip():.2f} "
                 f"Rtrig {xrt.get_right_trigger():.2f} Rgrip {xrt.get_right_grip():.2f}")
         body = xrt.is_body_data_available()
         b = f"body={'yes' if body else 'no '}"
