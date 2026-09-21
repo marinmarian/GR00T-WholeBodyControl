@@ -680,7 +680,21 @@ class EpisodeKeyController:
             self.ay_fired = False
 
 
+# Set by the manager for --inspire-hands handtracking: a callable returning the same 5-tuple as
+# _controller_inputs_raw, with trigger/grip taken from the tracked hands (#35). Everything that
+# consumes trigger/grip (Inspire bridge, hand IK for the ZMQ message) goes through
+# get_controller_inputs, so one switch covers all of it.
+_HAND_INPUT_OVERRIDE = None
+
+
 def get_controller_inputs(reader=None):
+    """Fetch controller button/trigger states (or hand-tracking equivalents, see _HAND_INPUT_OVERRIDE)."""
+    if _HAND_INPUT_OVERRIDE is not None:
+        return _HAND_INPUT_OVERRIDE()
+    return _controller_inputs_raw(reader)
+
+
+def _controller_inputs_raw(reader=None):
     """Fetch controller button/trigger states from XRoboToolkit or IsaacTeleop."""
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
@@ -2064,6 +2078,21 @@ def run_pico_manager(
     """
     reader = _init_input_source(input_source, buffer_size, use_adb=use_adb)
 
+    # --inspire-hands handtracking: trigger/grip come from the PICO hand tracking (finger curl ->
+    # trigger, thumb curl -> grip); buttons and sticks stay on the controllers. Falls back to the
+    # controller of that side when the hand is not tracked (after a 0.5 s hold).
+    global _HAND_INPUT_OVERRIDE
+    if inspire_hands == "handtracking":
+        if input_source != "xrt":
+            raise ValueError("--inspire-hands handtracking needs --input-source xrt (PICO hand tracking)")
+        from gear_sonic.utils.teleop.hand_tracking import HandTrackingInputs, debug_enabled
+
+        _HAND_INPUT_OVERRIDE = HandTrackingInputs.from_xrt(
+            lambda: _controller_inputs_raw(reader), debug=debug_enabled()
+        )
+        print("[Manager] Hand tracking drives the Inspire hands (fingers -> trigger, thumb -> grip); "
+              "controllers keep buttons/sticks; HAND_TRACKING_DEBUG=1 prints the sources", flush=True)
+
     # Optional Inspire RH56 hand bridge: maps controller trigger/squeeze to
     # finger angles over Modbus TCP, independent of the (Dex3-only) C++ deploy.
     inspire_bridge = None
@@ -2487,8 +2516,9 @@ if __name__ == "__main__":
         help=(
             "Drive Inspire RH56 hands over Modbus TCP (manager mode only): "
             "'trigger' maps controller trigger/squeeze to finger curl, "
-            "'handtracking' is reserved for per-finger headset tracking (not "
-            "implemented yet). Default: off (no hand I/O, PICO behavior unchanged)."
+            "'handtracking' takes trigger/grip from the PICO hand tracking instead "
+            "(finger curl / thumb curl; xrt input source only; controllers keep buttons). "
+            "Default: off (no hand I/O, PICO behavior unchanged)."
         ),
     )
     parser.add_argument(

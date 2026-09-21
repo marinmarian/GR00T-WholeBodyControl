@@ -93,7 +93,8 @@ class InspireBridge:
             (menu_button, left_trigger, right_trigger, left_squeeze, right_squeeze).
             Must be thread-safe (both the xrt globals and IsaacTeleopReader
             snapshot accessors are).
-        mode: "trigger" (supported) or "handtracking" (not implemented yet).
+        mode: "trigger" (controller trigger/grip) or "handtracking" (same values, produced
+            from the PICO hand tracking by the streamer; see gear_sonic/utils/teleop/hand_tracking.py).
         left_ip / right_ip: hand Modbus TCP addresses.
         rate_hz: write loop frequency (default HANDS_RATE_HZ).
         speed: Inspire per-DOF speed setting (0-1000) written once on connect.
@@ -105,13 +106,12 @@ class InspireBridge:
     def __init__(self, get_inputs, mode="trigger",
                  left_ip=DEFAULT_LEFT_IP, right_ip=DEFAULT_RIGHT_IP,
                  rate_hz=HANDS_RATE_HZ, speed=1000, sides=None, dump_publisher=None):
-        if mode == "handtracking":
-            raise NotImplementedError(
-                "inspire-hands mode 'handtracking' requires per-finger data from "
-                "the headset reader, which is not wired up yet — use 'trigger'."
-            )
-        if mode != "trigger":
+        # 'handtracking' is handled upstream of the bridge: the streamer's get_inputs then returns
+        # virtual trigger/grip values derived from the tracked hands (hand_tracking.py), so the
+        # mapping below is identical for both modes.
+        if mode not in ("trigger", "handtracking"):
             raise ValueError(f"unknown inspire-hands mode '{mode}'")
+        self._mode = mode
         if sides is None:
             sides = ("left", "right")
         sides = tuple(sides)
