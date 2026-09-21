@@ -459,8 +459,8 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
   waits for the port; if you start the client by hand, start it after the server listens.
 - **Local server: never `uv run`/`uv sync` in `~/Isaac-GR00T`.** Its root pyproject targets x86_64 cu128 and would
   replace the Thor venv. `source ~/g1-vr-teleop/rig/thor/env.sh` and use plain `python` (the scripts do).
-- **Local server and the C++ deploy share the Thor GPU.** Memory is not the issue (122 GB unified); controller jitter
-  would be. The check is the normal flow, nothing extra: `up`, wait for the serve pane to listen and `Init Done`, `k`.
+- **Local server and the C++ deploy share the Thor GPU.** Verified on the robot 2026-09-21 (closed loop ran with the
+  local server, controller healthy — Marin). If it ever needs re-checking, the check is the normal flow, nothing extra: `up`, wait for the serve pane to listen and `Init Done`, `k`.
   The client now requests a chunk every 0.4 s while the policy is still paused (step 2), so the GPU load is real —
   watch the deploy pane's timing lines (LowState age, policy, motor command) for a minute before `i`/`p`. Do not run
   `bench_policy.py` next to a live loop: it loads a second copy of the model.
