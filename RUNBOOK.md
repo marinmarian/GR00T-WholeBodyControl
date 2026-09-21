@@ -35,7 +35,7 @@ PICO enters exactly two addresses: **PC service `10.42.0.1`**, **Remote Vision `
 ```bash
 ssh mjolnir
 sudo -v                    # cache sudo so the script can start hotspot+querier itself
-~/sonic-teleop.sh up
+~/sonic-teleop.sh up       # symlink -> ~/GR00T-WholeBodyControl/tools/sonic-teleop.sh (since 2026-09-21; it was a stale copy before)
 tmux attach -t sonic
 ```
 
