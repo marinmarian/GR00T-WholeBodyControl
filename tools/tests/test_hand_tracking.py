@@ -31,17 +31,24 @@ def synth_hand(finger_flex_deg=0.0, thumb_flex_deg=0.0, scale=1.0):
     pts = chain((0.01, 0.03, 0), (0.7, 0.7), [0.04, 0.03, 0.025], thumb_flex_deg)  # meta, prox, dist, tip
     for jj, p in zip(ht.THUMB, pts):
         j[jj, :3] = p
+    if thumb_flex_deg >= 60:   # "closed": thumb wraps across the palm, tip next to the little proximal
+        j[ht.THUMB[3], :3] = j[ht.LITTLE[1], :3] + np.array([0.0, -0.01, 0.0]) * scale
     return j
 
 
 # straight fingers -> 0
 c = ht.hand_curls(synth_hand(0, 0)); assert c is not None
 assert c["fingers"] == 0.0 and c["thumb"] == 0.0, c
-# 70 deg per joint -> 210 deg total > FINGER_CLOSED_DEG -> 1.0 ; thumb 60/joint -> 120 > 100 -> 1.0
+# 70 deg per joint -> 210 deg total > FINGER_CLOSED_DEG -> 1.0 ; thumb tip across the palm -> ratio small -> 1.0
 c = ht.hand_curls(synth_hand(70, 60)); assert c["fingers"] == 1.0 and c["thumb"] == 1.0, c
 # mid flexion -> in between, monotonic, scale-invariant
 c1 = ht.hand_curls(synth_hand(30, 20)); c2 = ht.hand_curls(synth_hand(45, 30))
 assert 0.0 < c1["fingers"] < c2["fingers"] < 1.0, (c1, c2)
+assert c1["thumb"] == 0.0 and c2["thumb"] == 0.0                       # thumb away from the palm stays open
+# real PICO numbers from the 2026-09-21 probe: relaxed 26-53 deg -> 0, fist 142-190 -> ~1
+assert ht._normalize(53.0, ht.FINGER_OPEN_DEG, ht.FINGER_CLOSED_DEG) == 0.0
+assert ht._normalize(142.0, ht.FINGER_OPEN_DEG, ht.FINGER_CLOSED_DEG) >= 0.9
+assert ht._normalize(169.0, ht.FINGER_OPEN_DEG, ht.FINGER_CLOSED_DEG) == 1.0
 assert abs(ht.hand_curls(synth_hand(30, 20, scale=0.5))["fingers"] - c1["fingers"]) < 1e-9
 # untracked hand: zeros -> None (no NaN), wrong shape -> None, NaN -> None
 assert ht.hand_curls(np.zeros((26, 7))) is None

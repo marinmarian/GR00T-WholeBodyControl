@@ -33,11 +33,16 @@ LITTLE = (21, 22, 23, 24, 25)
 FINGERS = {"index": INDEX, "middle": MIDDLE, "ring": RING, "little": LITTLE}
 NUM_JOINTS = 26
 
-# Flexion sums (degrees) that map to fully open (0) / fully closed (1). A relaxed hand sums to
-# roughly 30-60 deg per finger, a fist to 200+; tune with tools/hand_tracking_probe.py.
-FINGER_OPEN_DEG = 40.0
-FINGER_CLOSED_DEG = 190.0
-THUMB_OPEN_DEG = 25.0
+# Flexion sums (degrees) that map to fully open (0) / fully closed (1). Measured on the PICO 4 Ultra
+# 2026-09-21 (tools/hand_tracking_probe.py): relaxed hand 26-53 deg per finger, fist 142-190.
+FINGER_OPEN_DEG = 55.0
+FINGER_CLOSED_DEG = 150.0
+# The thumb barely flexes in a fist on this tracker (32-35 deg vs 15-31 relaxed): it wraps by
+# opposition. So the thumb uses the distance thumb tip -> little-finger proximal joint, divided by
+# the palm length (wrist -> middle proximal) to stay scale-free: ~1.1+ open, ~0.5 across the palm.
+THUMB_OPEN_RATIO = 1.10
+THUMB_CLOSED_RATIO = 0.55
+THUMB_OPEN_DEG = 25.0        # flexion-sum variant, kept for the probe / tuning only
 THUMB_CLOSED_DEG = 100.0
 MIN_BONE_M = 0.003                    # shorter bones = untracked / zero data -> invalid
 SNAP_HIGH = 0.90                      # curl above this -> 1.0 (bridge FULL_PUSH is 0.95: no flapping)
@@ -57,6 +62,15 @@ def flexion_sum_deg(positions: np.ndarray, chain) -> float:
     p = np.asarray(positions, dtype=np.float64)
     bones = [p[chain[i + 1]] - p[chain[i]] for i in range(len(chain) - 1)]
     return sum(_angle_deg(bones[i], bones[i + 1]) for i in range(len(bones) - 1))
+
+
+def thumb_opposition_ratio(positions: np.ndarray) -> float:
+    """Thumb tip to little proximal distance over palm length; small = thumb across the palm."""
+    p = np.asarray(positions, dtype=np.float64)
+    palm = np.linalg.norm(p[MIDDLE[1]] - p[WRIST])
+    if palm < MIN_BONE_M:
+        raise ValueError("degenerate palm")
+    return float(np.linalg.norm(p[THUMB[3]] - p[LITTLE[1]]) / palm)
 
 
 def _normalize(x: float, open_deg: float, closed_deg: float) -> float:
@@ -83,7 +97,7 @@ def hand_curls(joints: np.ndarray):
     try:
         curls = {name: _normalize(flexion_sum_deg(pos, chain), FINGER_OPEN_DEG, FINGER_CLOSED_DEG)
                  for name, chain in FINGERS.items()}
-        curls["thumb"] = _normalize(flexion_sum_deg(pos, THUMB), THUMB_OPEN_DEG, THUMB_CLOSED_DEG)
+        curls["thumb"] = _normalize(thumb_opposition_ratio(pos), THUMB_OPEN_RATIO, THUMB_CLOSED_RATIO)
     except ValueError:
         return None
     curls["fingers"] = float(np.mean([curls[n] for n in FINGERS]))
@@ -98,6 +112,7 @@ def raw_flexion_sums(joints: np.ndarray):
     try:
         out = {name: flexion_sum_deg(j[:, :3], chain) for name, chain in FINGERS.items()}
         out["thumb"] = flexion_sum_deg(j[:, :3], THUMB)
+        out["thumb_ratio"] = thumb_opposition_ratio(j[:, :3])
         return out
     except ValueError:
         return None
@@ -153,7 +168,7 @@ class HandTrackingInputs:
             if self._debug:
                 sums = raw_flexion_sums(j) if has_data else None
                 self._diag[side] = (f"active={int(active)} data={'y' if has_data else 'n'}"
-                                    + (" sums " + "/".join(f"{sums[k]:.0f}" for k in ("index", "middle", "ring", "little", "thumb")) if sums else ""))
+                                    + (" sums " + "/".join(f"{sums[k]:.0f}" for k in ("index", "middle", "ring", "little")) + f" thr {sums['thumb_ratio']:.2f}" if sums else ""))
         except Exception as e:  # noqa: BLE001 - never let hand tracking take the teleop loop down
             curls = None
             if self._debug:
