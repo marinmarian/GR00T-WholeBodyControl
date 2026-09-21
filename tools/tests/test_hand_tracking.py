@@ -49,6 +49,11 @@ assert c1["thumb"] == 0.0 and c2["thumb"] == 0.0                       # thumb a
 assert ht._normalize(53.0, ht.FINGER_OPEN_DEG, ht.FINGER_CLOSED_DEG) == 0.0
 assert ht._normalize(142.0, ht.FINGER_OPEN_DEG, ht.FINGER_CLOSED_DEG) >= 0.9
 assert ht._normalize(169.0, ht.FINGER_OPEN_DEG, ht.FINGER_CLOSED_DEG) == 1.0
+# thumb ratio from the probe: open hand 1.4-1.6 -> 0, natural fist 0.8-1.0 -> mostly closed, folded 0.55 -> 1
+assert ht._normalize(1.4, ht.THUMB_OPEN_RATIO, ht.THUMB_CLOSED_RATIO) == 0.0
+assert ht._normalize(0.9, ht.THUMB_OPEN_RATIO, ht.THUMB_CLOSED_RATIO) >= 0.85
+assert 0.5 < ht._normalize(1.0, ht.THUMB_OPEN_RATIO, ht.THUMB_CLOSED_RATIO) < 0.9
+assert ht._normalize(0.55, ht.THUMB_OPEN_RATIO, ht.THUMB_CLOSED_RATIO) == 1.0
 assert abs(ht.hand_curls(synth_hand(30, 20, scale=0.5))["fingers"] - c1["fingers"]) < 1e-9
 # untracked hand: zeros -> None (no NaN), wrong shape -> None, NaN -> None
 assert ht.hand_curls(np.zeros((26, 7))) is None

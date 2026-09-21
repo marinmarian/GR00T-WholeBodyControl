@@ -39,9 +39,10 @@ FINGER_OPEN_DEG = 55.0
 FINGER_CLOSED_DEG = 150.0
 # The thumb barely flexes in a fist on this tracker (32-35 deg vs 15-31 relaxed): it wraps by
 # opposition. So the thumb uses the distance thumb tip -> little-finger proximal joint, divided by
-# the palm length (wrist -> middle proximal) to stay scale-free: ~1.1+ open, ~0.5 across the palm.
-THUMB_OPEN_RATIO = 1.10
-THUMB_CLOSED_RATIO = 0.55
+# the palm length (wrist -> middle proximal) to stay scale-free. Probe 2026-09-21: open hand 1.4-1.6,
+# natural fist 0.8-1.0 (thumb over the fingers), thumb folded across the palm ~0.55.
+THUMB_OPEN_RATIO = 1.35
+THUMB_CLOSED_RATIO = 0.85
 THUMB_OPEN_DEG = 25.0        # flexion-sum variant, kept for the probe / tuning only
 THUMB_CLOSED_DEG = 100.0
 MIN_BONE_M = 0.003                    # shorter bones = untracked / zero data -> invalid
