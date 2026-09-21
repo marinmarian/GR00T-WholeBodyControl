@@ -110,4 +110,22 @@ cruise = ib.InspireBridge._force_set_from_baseline(base)
 assert lim[3] == ib.FORCE_SET_MAX_G and lim[0] == cruise[0] and lim[4] == cruise[4], lim
 lim2 = ib.InspireBridge._force_set_for_inputs(base, 1.0, 1.0)      # trigger path unchanged
 assert all(lim2[i] == ib.FORCE_SET_MAX_G for i in range(5)), lim2
+
+# ---- thumb rotation: the synthetic hand is planar (thumb in the palm plane) -> angle 90 -> closure 0
+flat = synth_hand(0, 0)
+assert abs(ht.thumb_rotation_angle_deg(flat) - 90.0) < 1e-6
+assert ht.hand_curls(flat)["thumb_rot"] == 0.0
+# lift the thumb distal joint out of the palm plane along the normal -> small angle -> closure 1
+opp = synth_hand(0, 0); n = ht.palm_normal(opp[:, :3])
+opp[ht.THUMB[2], :3] = opp[ht.THUMB[1], :3] + 0.03 * n
+assert ht.thumb_rotation_angle_deg(opp) < 1e-6
+assert ht.hand_curls(opp)["thumb_rot"] == 1.0
+st6 = {"hand": opp}
+p6 = ht.HandTrackingInputs(lambda: (False, 0, 0, 0, 0), lambda s: (st6["hand"], 1), alpha=1.0, clock=lambda: 0.0)
+p6(); assert p6.finger_targets()["left"][5] == 1.0
+import os
+os.environ["HAND_TRACKING_THUMB_ROT"] = "0"
+p7 = ht.HandTrackingInputs(lambda: (False, 0, 0, 0, 0), lambda s: (st6["hand"], 1), alpha=1.0, clock=lambda: 0.0)
+p7(); assert p7.finger_targets()["left"][5] is None
+del os.environ["HAND_TRACKING_THUMB_ROT"]
 print("HAND_TRACKING_TEST_OK")

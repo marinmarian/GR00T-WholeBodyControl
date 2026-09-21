@@ -19,6 +19,8 @@ What to do while it runs:
   4. Make a fist: 'fingers' trigger must read 1.00. Open flat: 0.00. Note the raw sums for tuning.
      Thumb: 'thr' is thumb-tip-to-little-knuckle over palm length (open ~1.1+, across the palm ~0.5);
      fold the thumb over the palm and check 'grip' rises to 1.00.
+     'tra' is the thumb-bone angle to the palm normal: flat hand ~80-90 (rot 0.00), thumb pointing
+     out of the palm / opposed ~20-40 (rot 1.00). Note both values for tuning.
   5. Watch 'body' and the wrist positions with controllers down: if they stop updating, arm
      tracking will not work in hand-tracking mode.
   6. Pick the controllers back up: 'controllers moving' must return and btn= must show A/B/X/Y
@@ -75,9 +77,9 @@ try:
             nz = int(np.count_nonzero(np.any(np.abs(j[:, :3]) > 1e-9, axis=1))) if j.shape == (26, 7) else -1
             s = f"{side} active={active} data={'yes' if has_data else 'no '}({nz:2d}/26)"
             if sums:
-                s += " sums(deg) " + " ".join(f"{k[:3]}={v:5.0f}" for k, v in sums.items() if k != "thumb_ratio") + f" thr={sums['thumb_ratio']:.2f}"
+                s += " sums(deg) " + " ".join(f"{k[:3]}={v:5.0f}" for k, v in sums.items() if k not in ("thumb_ratio", "thumb_rot_deg")) + f" thr={sums['thumb_ratio']:.2f} tra={sums['thumb_rot_deg']:3.0f}"
             if curls:
-                s += f" -> trigger {curls['fingers']:.2f} grip {curls['thumb']:.2f}"
+                s += f" -> trigger {curls['fingers']:.2f} grip {curls['thumb']:.2f} rot {curls['thumb_rot']:.2f}"
             if has_data:
                 w = j[ht.WRIST, :3]; s += f" wrist({w[0]:+.2f},{w[1]:+.2f},{w[2]:+.2f})"
             rows.append(s)

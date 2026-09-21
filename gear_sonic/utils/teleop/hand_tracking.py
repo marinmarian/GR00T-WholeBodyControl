@@ -45,6 +45,12 @@ THUMB_OPEN_RATIO = 1.35
 THUMB_CLOSED_RATIO = 0.85
 THUMB_OPEN_DEG = 25.0        # flexion-sum variant, kept for the probe / tuning only
 THUMB_CLOSED_DEG = 100.0
+# Thumb base rotation (Inspire DOF 5): angle between the thumb proximal->distal bone and the palm
+# normal. Thumb flat in the finger plane ~80-90 deg -> closure 0 (Inspire 1000); thumb opposed,
+# pointing out of the palm, ~20-40 deg -> closure 1 (Inspire 0 = pinch preset). Tune with the probe
+# (tra=). HAND_TRACKING_THUMB_ROT=0 leaves the rotation at rest.
+THUMB_ROT_FLAT_DEG = 75.0
+THUMB_ROT_OPPOSED_DEG = 35.0
 MIN_BONE_M = 0.003                    # shorter bones = untracked / zero data -> invalid
 SNAP_HIGH = 0.90                      # curl above this -> 1.0 (bridge FULL_PUSH is 0.95: no flapping)
 SNAP_LOW = 0.05                       # below this -> 0.0
@@ -74,6 +80,28 @@ def thumb_opposition_ratio(positions: np.ndarray) -> float:
     return float(np.linalg.norm(p[THUMB[3]] - p[LITTLE[1]]) / palm)
 
 
+def palm_normal(positions: np.ndarray) -> np.ndarray:
+    """Unit normal of the palm plane from wrist, index metacarpal and little metacarpal."""
+    p = np.asarray(positions, dtype=np.float64)
+    u, v = p[INDEX[0]] - p[WRIST], p[LITTLE[0]] - p[WRIST]
+    n = np.cross(u, v)
+    ln = np.linalg.norm(n)
+    if ln < MIN_BONE_M * MIN_BONE_M:
+        raise ValueError("degenerate palm")
+    return n / ln
+
+
+def thumb_rotation_angle_deg(positions: np.ndarray) -> float:
+    """Angle (0..90 deg) between the thumb proximal->distal bone and the palm normal."""
+    p = np.asarray(positions, dtype=np.float64)
+    bone = p[THUMB[2]] - p[THUMB[1]]
+    lb = np.linalg.norm(bone)
+    if lb < MIN_BONE_M:
+        raise ValueError("degenerate thumb")
+    c = abs(float(np.dot(bone / lb, palm_normal(p))))
+    return math.degrees(math.acos(max(-1.0, min(1.0, c))))
+
+
 def _normalize(x: float, open_deg: float, closed_deg: float) -> float:
     c = (x - open_deg) / (closed_deg - open_deg)
     c = min(1.0, max(0.0, c))
@@ -99,6 +127,7 @@ def hand_curls(joints: np.ndarray):
         curls = {name: _normalize(flexion_sum_deg(pos, chain), FINGER_OPEN_DEG, FINGER_CLOSED_DEG)
                  for name, chain in FINGERS.items()}
         curls["thumb"] = _normalize(thumb_opposition_ratio(pos), THUMB_OPEN_RATIO, THUMB_CLOSED_RATIO)
+        curls["thumb_rot"] = _normalize(thumb_rotation_angle_deg(pos), THUMB_ROT_FLAT_DEG, THUMB_ROT_OPPOSED_DEG)
     except ValueError:
         return None
     curls["fingers"] = float(np.mean([curls[n] for n in FINGERS]))
@@ -114,6 +143,7 @@ def raw_flexion_sums(joints: np.ndarray):
         out = {name: flexion_sum_deg(j[:, :3], chain) for name, chain in FINGERS.items()}
         out["thumb"] = flexion_sum_deg(j[:, :3], THUMB)
         out["thumb_ratio"] = thumb_opposition_ratio(j[:, :3])
+        out["thumb_rot_deg"] = thumb_rotation_angle_deg(j[:, :3])
         return out
     except ValueError:
         return None
@@ -140,8 +170,9 @@ class HandTrackingInputs:
         self._debug = debug
         self._clock = clock
         self._ema = {"left": None, "right": None}       # (trigger, grip)
-        # per-DOF closures in Inspire order [little, ring, middle, index, thumb_bend], smoothed
+        # per-DOF closures in Inspire order [little, ring, middle, index, thumb_bend, thumb_rot], smoothed
         self._ema_dof = {"left": None, "right": None}
+        self._thumb_rot = os.environ.get("HAND_TRACKING_THUMB_ROT", "1") not in ("", "0")
         self._last_valid = {"left": None, "right": None}
         self._source = {"left": "controller", "right": "controller"}
         self._diag = {"left": "", "right": ""}
@@ -171,18 +202,18 @@ class HandTrackingInputs:
             if self._debug:
                 sums = raw_flexion_sums(j) if has_data else None
                 self._diag[side] = (f"active={int(active)} data={'y' if has_data else 'n'}"
-                                    + (" sums " + "/".join(f"{sums[k]:.0f}" for k in ("index", "middle", "ring", "little")) + f" thr {sums['thumb_ratio']:.2f}" if sums else ""))
+                                    + (" sums " + "/".join(f"{sums[k]:.0f}" for k in ("index", "middle", "ring", "little")) + f" thr {sums['thumb_ratio']:.2f} tra {sums['thumb_rot_deg']:.0f}" if sums else ""))
         except Exception as e:  # noqa: BLE001 - never let hand tracking take the teleop loop down
             curls = None
             if self._debug:
                 self._diag[side] = f"read error {e}"
         if curls is not None:
-            dof = [curls["little"], curls["ring"], curls["middle"], curls["index"], curls["thumb"]]
+            dof = [curls["little"], curls["ring"], curls["middle"], curls["index"], curls["thumb"], curls["thumb_rot"]]
             prev_dof = self._ema_dof[side]
             if prev_dof is None:
                 ema_dof = dof
             else:
-                ema_dof = [prev_dof[i] + self._alpha * (dof[i] - prev_dof[i]) for i in range(5)]
+                ema_dof = [prev_dof[i] + self._alpha * (dof[i] - prev_dof[i]) for i in range(6)]
             self._ema_dof[side] = [1.0 if v >= SNAP_HIGH else (0.0 if v <= SNAP_LOW else v) for v in ema_dof]
             target = (curls["fingers"], curls["thumb"])
             prev = self._ema[side]
@@ -207,12 +238,15 @@ class HandTrackingInputs:
     def finger_targets(self):
         """Per-DOF closures for the Inspire bridge: {"left": [little, ring, middle, index,
         thumb_bend, thumb_rot] | None, "right": ...}. None while that side is on its controller
-        (the bridge then uses the trigger/grip mapping). thumb_rot is None (rest) for now.
-        Uses the values of the last __call__ (same tick as the trigger/grip it returned)."""
+        (the bridge then uses the trigger/grip mapping). thumb_rot is None (= rest) when
+        HAND_TRACKING_THUMB_ROT=0. Uses the values of the last __call__."""
         out = {}
         for side in ("left", "right"):
             d = self._ema_dof[side]
-            out[side] = None if (d is None or self._source[side] == "controller") else list(d) + [None]
+            if d is None or self._source[side] == "controller":
+                out[side] = None
+            else:
+                out[side] = list(d[:5]) + [d[5] if self._thumb_rot else None]
         return out
 
     def __call__(self):
