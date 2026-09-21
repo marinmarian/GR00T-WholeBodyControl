@@ -105,7 +105,8 @@ class InspireBridge:
 
     def __init__(self, get_inputs, mode="trigger",
                  left_ip=DEFAULT_LEFT_IP, right_ip=DEFAULT_RIGHT_IP,
-                 rate_hz=HANDS_RATE_HZ, speed=1000, sides=None, dump_publisher=None):
+                 rate_hz=HANDS_RATE_HZ, speed=1000, sides=None, dump_publisher=None,
+                 get_targets=None):
         # 'handtracking' is handled upstream of the bridge: the streamer's get_inputs then returns
         # virtual trigger/grip values derived from the tracked hands (hand_tracking.py), so the
         # mapping below is identical for both modes.
@@ -121,6 +122,10 @@ class InspireBridge:
         if unknown:
             raise ValueError(f"unknown hand sides {unknown}")
         self._get_inputs = get_inputs
+        # Optional per-DOF source (hand tracking): callable -> {"left": closures6 | None, "right": ...}
+        # with closures in 0..1 in DOF order [little, ring, middle, index, thumb_bend, thumb_rot];
+        # None for a side = use the trigger/grip mapping for that side this tick.
+        self._get_targets = get_targets
         self._rate_hz = float(rate_hz)
         self._dt = 1.0 / self._rate_hz
         self._speed = int(speed)
@@ -239,8 +244,11 @@ class InspireBridge:
 
     @staticmethod
     def _force_set_for_inputs(baseline, trigger, squeeze, contacts=None,
-                              actual=None, desired=None):
+                              actual=None, desired=None, closures=None):
         """Cruise cap, or firmware max on full trigger (fingers) / grip (thumb_bend).
+
+        With per-DOF ``closures`` (hand tracking) the full-push rule is applied per finger:
+        only a finger commanded >= FULL_PUSH closed gets FORCE_SET_MAX.
 
         Partial trigger: if some fingers have contacted, free fingers that are
         still short of the trigger desired angle get FORCE_SET_MAX so coupled
@@ -248,6 +256,25 @@ class InspireBridge:
         Closing in air (no contact) stays cruise. Cmd never wraps past desired.
         """
         limits = InspireBridge._force_set_from_baseline(baseline)
+        if closures is not None:
+            for i in range(FINGER_DOFS):
+                if closures[i] is not None and float(closures[i]) >= FULL_PUSH:
+                    limits[i] = FORCE_SET_MAX_G
+            if closures[4] is not None and float(closures[4]) >= FULL_PUSH:
+                limits[4] = FORCE_SET_MAX_G
+            if contacts is not None and any(
+                    i < len(contacts) and contacts[i] for i in range(FINGER_DOFS)):
+                for i in range(FINGER_DOFS):
+                    if (i < len(contacts) and contacts[i]) or limits[i] == FORCE_SET_MAX_G:
+                        continue
+                    short = (
+                        actual is not None and desired is not None
+                        and i < len(actual) and i < len(desired)
+                        and actual[i] - desired[i] > STALL_ERR
+                    )
+                    if short:
+                        limits[i] = FORCE_SET_MAX_G
+            return limits
         if float(trigger) >= FULL_PUSH:
             for i in range(FINGER_DOFS):
                 limits[i] = FORCE_SET_MAX_G
@@ -398,6 +425,18 @@ class InspireBridge:
         return hits
 
     @staticmethod
+    def _targets_from_closures(closures):
+        """Map 6 per-DOF closures (0 open .. 1 closed) to Inspire angles.
+
+        thumb_rot (index 5) stays at THUMB_ROT_REST unless a value is given: hand tracking does
+        not estimate the base rotation yet.
+        """
+        c = [min(max(float(v), 0.0), 1.0) if v is not None else None for v in closures]
+        out = [OPEN - (c[i] or 0.0) * OPEN for i in range(5)]
+        out.append(THUMB_ROT_REST if c[5] is None else OPEN - c[5] * OPEN)
+        return out
+
+    @staticmethod
     def _targets_from_triggers(trigger, squeeze):
         """Map (trigger, squeeze) in 0..1 to 6 Inspire angles."""
         t = min(max(float(trigger), 0.0), 1.0)
@@ -464,7 +503,7 @@ class InspireBridge:
 
     def _write_side(self, side, targets, readback=False,
                     lt=0.0, rt=0.0, lg=0.0, rg=0.0, dt_s=None,
-                    read_tactile=True):
+                    read_tactile=True, closures=None):
         hand = self._hands[side]
         if not hand.connected:
             now = time.time()
@@ -520,7 +559,7 @@ class InspireBridge:
         trigger, squeeze = (lt, lg) if side == "left" else (rt, rg)
         force_set = self._force_set_for_inputs(
             self._force_base.get(side), trigger, squeeze,
-            contacts=contacts, actual=act, desired=cmd)
+            contacts=contacts, actual=act, desired=cmd, closures=closures)
         if act is not None:
             self._prev_actual[side] = list(act)
         if self._last_force_set[side] != force_set:
@@ -587,6 +626,19 @@ class InspireBridge:
             t0 = time.time()
             try:
                 _, lt, rt, lg, rg = self._get_inputs()
+                per_dof = self._get_targets() if self._get_targets is not None else {}
+                # For logging/publishing, a per-DOF side reports mean finger closure as trigger
+                # and thumb_bend closure as grip.
+                for side, (t_name, g_name) in (("left", ("lt", "lg")), ("right", ("rt", "rg"))):
+                    cl = per_dof.get(side) if per_dof else None
+                    if cl is not None:
+                        fingers = [float(v) for v in cl[:4] if v is not None]
+                        t_val = sum(fingers) / len(fingers) if fingers else 0.0
+                        g_val = float(cl[4]) if cl[4] is not None else 0.0
+                        if side == "left":
+                            lt, lg = t_val, g_val
+                        else:
+                            rt, rg = t_val, g_val
                 _cur = (round(lt, 2), round(rt, 2), round(lg, 2), round(rg, 2))
                 _prev = getattr(self, "_dbg_prev", None)
                 changed = _prev is not None and _cur != _prev
@@ -599,11 +651,14 @@ class InspireBridge:
                 self._loop_tick += 1
                 for side in self._hands:
                     t, s = trig[side]
+                    cl = per_dof.get(side) if per_dof else None
+                    targets = (self._targets_from_closures(cl) if cl is not None
+                               else self._targets_from_triggers(t, s))
                     w = self._write_side(
-                        side, self._targets_from_triggers(t, s),
+                        side, targets,
                         readback=changed,
                         lt=lt, rt=rt, lg=lg, rg=rg, dt_s=_dt,
-                        read_tactile=read_tactile)
+                        read_tactile=read_tactile, closures=cl)
                     if w:
                         writes[side] = w
                 if changed:
