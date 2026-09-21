@@ -66,14 +66,14 @@ def _angle_deg(u: np.ndarray, v: np.ndarray) -> float:
 
 def flexion_sum_deg(positions: np.ndarray, chain) -> float:
     """Sum of the angles between consecutive bones of one finger chain (0 = straight)."""
-    p = np.asarray(positions, dtype=np.float64)
+    p = np.asarray(positions, dtype=np.float64)[:, :3]
     bones = [p[chain[i + 1]] - p[chain[i]] for i in range(len(chain) - 1)]
     return sum(_angle_deg(bones[i], bones[i + 1]) for i in range(len(bones) - 1))
 
 
 def thumb_opposition_ratio(positions: np.ndarray) -> float:
     """Thumb tip to little proximal distance over palm length; small = thumb across the palm."""
-    p = np.asarray(positions, dtype=np.float64)
+    p = np.asarray(positions, dtype=np.float64)[:, :3]   # accept (26,7) pose rows too
     palm = np.linalg.norm(p[MIDDLE[1]] - p[WRIST])
     if palm < MIN_BONE_M:
         raise ValueError("degenerate palm")
@@ -82,7 +82,7 @@ def thumb_opposition_ratio(positions: np.ndarray) -> float:
 
 def palm_normal(positions: np.ndarray) -> np.ndarray:
     """Unit normal of the palm plane from wrist, index metacarpal and little metacarpal."""
-    p = np.asarray(positions, dtype=np.float64)
+    p = np.asarray(positions, dtype=np.float64)[:, :3]   # accept (26,7) pose rows too
     u, v = p[INDEX[0]] - p[WRIST], p[LITTLE[0]] - p[WRIST]
     n = np.cross(u, v)
     ln = np.linalg.norm(n)
@@ -93,7 +93,7 @@ def palm_normal(positions: np.ndarray) -> np.ndarray:
 
 def thumb_rotation_angle_deg(positions: np.ndarray) -> float:
     """Angle (0..90 deg) between the thumb proximal->distal bone and the palm normal."""
-    p = np.asarray(positions, dtype=np.float64)
+    p = np.asarray(positions, dtype=np.float64)[:, :3]   # accept (26,7) pose rows too
     bone = p[THUMB[2]] - p[THUMB[1]]
     lb = np.linalg.norm(bone)
     if lb < MIN_BONE_M:

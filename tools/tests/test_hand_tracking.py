@@ -95,8 +95,8 @@ st = {"hand": one}
 p4 = ht.HandTrackingInputs(lambda: (False, 0, 0, 0, 0), lambda s: (st["hand"], 1), alpha=1.0, clock=lambda: 0.0)
 p4()
 ft = p4.finger_targets()
-assert ft["left"] == [0.0, 0.0, 0.0, 1.0, 0.0, None], ft          # [little, ring, middle, index, thumb_bend, thumb_rot]
-assert ft["right"] == [0.0, 0.0, 0.0, 1.0, 0.0, None]
+assert ft["left"] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0], ft          # [little, ring, middle, index, thumb_bend, thumb_rot]
+assert ft["right"] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 # side on its controller -> None (bridge falls back to trigger mapping)
 p5 = ht.HandTrackingInputs(lambda: (False, 0.3, 0, 0, 0), lambda s: (np.zeros((26, 7)), 0), clock=lambda: 0.0)
 p5(); assert p5.finger_targets() == {"left": None, "right": None}
