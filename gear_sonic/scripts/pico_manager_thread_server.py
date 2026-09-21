@@ -2103,6 +2103,8 @@ def run_pico_manager(
         from gear_sonic.utils.teleop.inspire.inspire_bridge import InspireBridge
 
         bridge_kwargs = {"mode": inspire_hands}
+        if inspire_hands == "handtracking" and _HAND_INPUT_OVERRIDE is not None:
+            bridge_kwargs["get_targets"] = _HAND_INPUT_OVERRIDE.finger_targets  # per-finger closures
         if inspire_left_ip:
             bridge_kwargs["left_ip"] = inspire_left_ip
         if inspire_right_ip:
