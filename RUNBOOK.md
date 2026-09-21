@@ -66,8 +66,9 @@ tmux attach -t sonic
 ### Hand tracking instead of triggers (experimental, 2026-09-21, issue #35)
 
 `INSPIRE_HANDS=handtracking ~/sonic-teleop.sh up` makes the Inspire hands follow your fingers instead
-of the triggers: mean finger curl → four-finger close, thumb curl → thumb bend (same bridge, same
-force logic, same recorded hand state). Everything else stays on the controllers: `A+X` mode toggle,
+of the triggers: **each finger on its own** (little, ring, middle, index from the finger curl, thumb bend
+from the thumb-across-palm distance; thumb rotation stays at rest), same bridge, same force logic per
+finger, same recorded hand state. Everything else stays on the controllers: `A+X` mode toggle,
 `A+B+X+Y` e-stop, gaits, sticks, recording gestures — the streamer has no keyboard control, so
 **keep the controllers within reach**; `O` in the deploy pane still works from the keyboard.
 
