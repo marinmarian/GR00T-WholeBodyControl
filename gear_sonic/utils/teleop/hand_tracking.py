@@ -126,7 +126,11 @@ class HandTrackingInputs:
         self._ema = {"left": None, "right": None}       # (trigger, grip)
         self._last_valid = {"left": None, "right": None}
         self._source = {"left": "controller", "right": "controller"}
+        self._diag = {"left": "", "right": ""}
         self._last_print = 0.0
+        # HAND_TRACKING_IGNORE_ACTIVE=1: use the joints whenever the geometry is valid, even if the
+        # headset reports isActive=0 (some app versions report 0 = "low quality" while tracking).
+        self._ignore_active = os.environ.get("HAND_TRACKING_IGNORE_ACTIVE", "") not in ("", "0")
 
     @classmethod
     def from_xrt(cls, controller_inputs, **kw):
@@ -142,9 +146,18 @@ class HandTrackingInputs:
     def _side(self, side, ctrl_trigger, ctrl_grip, now):
         try:
             joints, active = self._read_hand(side)
-            curls = hand_curls(np.asarray(joints)) if int(active) == 1 else None
-        except Exception:  # noqa: BLE001 - never let hand tracking take the teleop loop down
+            j = np.asarray(joints, dtype=np.float64)
+            has_data = j.shape[0] == NUM_JOINTS and not np.allclose(j[:, :3], 0.0)
+            use = has_data and (int(active) == 1 or self._ignore_active)
+            curls = hand_curls(j) if use else None
+            if self._debug:
+                sums = raw_flexion_sums(j) if has_data else None
+                self._diag[side] = (f"active={int(active)} data={'y' if has_data else 'n'}"
+                                    + (" sums " + "/".join(f"{sums[k]:.0f}" for k in ("index", "middle", "ring", "little", "thumb")) if sums else ""))
+        except Exception as e:  # noqa: BLE001 - never let hand tracking take the teleop loop down
             curls = None
+            if self._debug:
+                self._diag[side] = f"read error {e}"
         if curls is not None:
             target = (curls["fingers"], curls["thumb"])
             prev = self._ema[side]
@@ -172,8 +185,8 @@ class HandTrackingInputs:
         rt2, rg2 = self._side("right", rt, rg, now)
         if self._debug and now - self._last_print > 1.0:
             self._last_print = now
-            print(f"[HandTracking] L {self._source['left']:10s} trig {lt2:.2f} grip {lg2:.2f} | "
-                  f"R {self._source['right']:10s} trig {rt2:.2f} grip {rg2:.2f}", flush=True)
+            print(f"[HandTracking] L {self._source['left']:10s} trig {lt2:.2f} grip {lg2:.2f} ({self._diag['left']}) | "
+                  f"R {self._source['right']:10s} trig {rt2:.2f} grip {rg2:.2f} ({self._diag['right']})", flush=True)
         return menu, lt2, rt2, lg2, rg2
 
     @property
