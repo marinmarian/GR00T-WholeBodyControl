@@ -4,7 +4,8 @@
 # Env overrides: POLICY_MODE=local|ec2 (default local: GR00T server on this Thor, loopback 5550;
 #                ec2: SSH tunnel -> darwin-gpu:5550, start the server there yourself),
 #                POLICY_MODEL=best34|v2 (checkpoint the local server loads), PROMPT, POLICY_HOST/POLICY_PORT,
-#                HANDS=0 (skip Inspire bridge)
+#                HANDS=0 (skip Inspire bridge), HANDS_SIDES=right|left (one hand detached; that side's
+#                hand state falls back to the C++ zeros = open, which is what the training data shows)
 #
 # Layout:  window "svc": serve (local policy server) or tunnel | cam-g1 (head IR push) | cam-sender (OBSBOT + head, --autostart, ZMQ 5555)
 #          window "run": deploy (C++ SONIC, container) | inference (run_vla_inference) | hands (Inspire) | keys
@@ -49,7 +50,8 @@ DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model
 # server is down -> never start it before the server listens (a local server needs 1-2 min to load 12 GB).
 WAIT_SERVER="until ss -ltn | grep -q ':$POLICY_PORT '; do echo 'waiting for policy server on :$POLICY_PORT ...'; sleep 3; done"
 INFER_CMD="cd $REPO && source .venv_inference/bin/activate && python gear_sonic/scripts/run_vla_inference.py --host $POLICY_HOST --port $POLICY_PORT --embodiment-tag unitree_g1_sonic --prompt '$PROMPT' --camera-host 127.0.0.1 --camera-port 5555 --initial-motion-token-path gear_sonic/utils/inference/initial_motion_token_restocking.npy"
-HANDS_CMD="cd $REPO && source .venv_inference/bin/activate && python gear_sonic/scripts/inspire_vla_bridge.py"
+HANDS_SIDES="${HANDS_SIDES:-left,right}"               # e.g. HANDS_SIDES=right when the left Inspire hand is detached
+HANDS_CMD="cd $REPO && source .venv_inference/bin/activate && python gear_sonic/scripts/inspire_vla_bridge.py --sides $HANDS_SIDES"
 KEYS_CMD="cd $REPO && source .venv_inference/bin/activate && python tools/vla_keys.py"
 
 case "${1:-up}" in
