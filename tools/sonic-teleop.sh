@@ -28,7 +28,8 @@ CAM_G1=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_Intel_R__Real
 # INSPIRE_HANDS=trigger (default: controller trigger/grip) | handtracking (PICO hand tracking, #35, experimental:
 # fingers -> trigger, thumb -> grip; buttons/sticks/e-stop stay on the controllers, keep them within reach) | off
 INSPIRE_HANDS="${INSPIRE_HANDS:-trigger}"
-STREAMER_CMD="cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && ${HAND_TRACKING_DEBUG:+HAND_TRACKING_DEBUG=1 }python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source xrt --inspire-hands $INSPIRE_HANDS"
+# Streamer output is also written to logs/streamer-last-run.log (unbuffered) so a run can be diagnosed after `down`.
+STREAMER_CMD="cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && mkdir -p logs && ${HAND_TRACKING_DEBUG:+HAND_TRACKING_DEBUG=1 }python -u gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source xrt --inspire-hands $INSPIRE_HANDS 2>&1 | tee logs/streamer-last-run.log"
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
 DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
 # Head IR is pushed from g1 to mjolnir over RTP (5600 = composite's right half,
