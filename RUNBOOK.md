@@ -80,8 +80,12 @@ force logic, same recorded hand state). Everything else stays on the controllers
   and the wrist positions with controllers down — arm tracking comes from the body tracker).
 - `HAND_TRACKING_DEBUG=1` prints once a second whether each side is driven by `hand`, `hold` or
   `controller`. Tuning constants (`FINGER_OPEN_DEG` …) live in `gear_sonic/utils/teleop/hand_tracking.py`.
-- Not yet validated on the headset (2026-09-21): joint order, whether controllers and hands stream
-  at the same time, and whether body tracking survives without controllers are the open questions.
+- Measured 2026-09-21 with the probe: hands become `active=1` about **5 s** after the controllers are
+  put down (before that the headset sends a placeholder pose, ignored); picking a controller up drops
+  the hands within 1 s and its buttons register about **2 s** later. Body tracking (arms) keeps working
+  with the controllers down. Joint order is OpenXR as assumed. Relaxed fingers 26-53°, fist 142-190°.
+- Stopping: `A+B+X+Y` needs all four buttons **together** on both controllers, at least 2 s after
+  pickup, and the streamer ignores a second combo within 3 s. `O` in the deploy pane is the sure stop.
 
 ### Recording (PICO controller or KEYS pane)
 The script runs the **ZMQ exporter** (`gear_sonic/scripts/run_data_exporter.py`)
