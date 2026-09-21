@@ -137,6 +137,16 @@ class InferenceConfig:
     blends from its current motion token to the initial pose token over this
     period. Set to 0 to snap instantly (no blend)."""
 
+    # Sensor-loss guard (g1-vr-teleop #26)
+    sensor_loss_pause_s: float = 1.0
+    """Pause the policy when no VALID observation (both camera views present and fresh, robot state
+    present) has been seen for this long. The C++ loop keeps holding; no actions are sent, so the
+    Inspire bridge opens the hands after its --action-max-age (2 s). 0 disables the guard."""
+
+    auto_resume_after_sensor_loss: bool = False
+    """Resume on its own once observations are valid again. Default False: stay paused until the
+    operator presses 'p' (2026-09-11 the robot resumed unprompted when the head camera came back)."""
+
     # Debug
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
@@ -148,6 +158,65 @@ MAX_VIEW_SKEW_S = 0.5
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
+
+
+def print_red(x):
+    print(f"\033[91m{x}\033[0m", flush=True)
+
+
+def print_yellow(x):
+    print(f"\033[93m{x}\033[0m", flush=True)
+
+
+class SensorLossGuard:
+    """Pause the policy after a sensor outage and keep it paused until the operator resumes (#26).
+
+    Pure logic so it can be unit-tested (tools/tests/test_sensor_loss_guard.py). The inference worker
+    calls ``observation_valid(now)`` whenever ``prepare_observation_from_sensors`` returns an
+    observation; the control loop calls ``update(now, paused)`` every tick and acts on the event:
+
+    ``"pause"``      no valid observation for more than ``threshold_s`` while running -> stop acting
+    ``"recovered"``  observations are valid again but we stay paused (printed once) -> wait for 'p'
+    ``"resume"``     same, with ``auto_resume`` -> resume
+    ``None``         nothing to do
+
+    Unarmed until the first valid observation (before 'k' there is no robot state at all).
+    """
+
+    def __init__(self, threshold_s: float, auto_resume: bool = False):
+        self.threshold_s = float(threshold_s)
+        self.auto_resume = auto_resume
+        self.last_valid: float | None = None
+        self.tripped = False
+        self.outage_s = 0.0
+        self._recovered_reported = False
+
+    def observation_valid(self, now: float) -> None:
+        self.last_valid = now
+
+    def operator_resumed(self) -> None:
+        """'p' pressed to resume: a still-dead sensor re-trips on the next tick."""
+        self.tripped = False
+
+    def update(self, now: float, paused: bool):
+        if self.threshold_s <= 0 or self.last_valid is None:
+            return None
+        age = now - self.last_valid
+        if not self.tripped:
+            if not paused and age > self.threshold_s:
+                self.tripped = True
+                self.outage_s = age
+                self._recovered_reported = False
+                return "pause"
+            return None
+        if age <= self.threshold_s:
+            if self.auto_resume:
+                self.tripped = False
+                return "resume"
+            if not self._recovered_reported:
+                self._recovered_reported = True
+                return "recovered"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +600,8 @@ def main(config: InferenceConfig):
     cpp_loop_running = False
     cpp_mode = "OFF"  # "OFF", "PLANNER", or "POSE"
 
+    sensor_guard = SensorLossGuard(config.sensor_loss_pause_s, config.auto_resume_after_sensor_loss)
+
     # Track initial pose hand states
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
@@ -699,6 +770,7 @@ def main(config: InferenceConfig):
             if pause_loop:
                 print("Policy loop paused (C++ loop still running - press 'k' to stop)")
             else:
+                sensor_guard.operator_resumed()
                 print("Policy loop resumed")
         elif key == "k":
             # Stateless on purpose: the C++ deploy may have been restarted behind our back (it
@@ -739,6 +811,26 @@ def main(config: InferenceConfig):
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
 
+    if config.sensor_loss_pause_s > 0:
+        print_green(
+            f"Sensor-loss guard: pause after {config.sensor_loss_pause_s:.1f} s without a valid observation"
+            + (", auto-resume ON" if config.auto_resume_after_sensor_loss else ", resume with 'p'")
+        )
+
+    def prepare_obs_with_guard():
+        obs = prepare_observation_from_sensors(
+            camera_subscriber=camera_subscriber,
+            state_subscriber=state_subscriber,
+            robot_model=robot_model,
+            language_prompt=language_prompt_ref[0],
+            log_errors=True,
+            video_keys=video_keys,
+            hand_state_fn=hand_state_fn,
+        )
+        if obs is not None:
+            sensor_guard.observation_valid(time.monotonic())
+        return obs
+
     inference_worker_thread = threading.Thread(
         target=_inference_worker_loop,
         args=(
@@ -746,15 +838,7 @@ def main(config: InferenceConfig):
             result_queue,
             inference_stop_event,
             inference_busy_event,
-            lambda: prepare_observation_from_sensors(
-                camera_subscriber=camera_subscriber,
-                state_subscriber=state_subscriber,
-                robot_model=robot_model,
-                language_prompt=language_prompt_ref[0],
-                log_errors=True,
-                video_keys=video_keys,
-                hand_state_fn=hand_state_fn,
-            ),
+            prepare_obs_with_guard,
             lambda obs: run_policy_inference_and_process(
                 policy=n1_policy,
                 observation=obs,
@@ -799,6 +883,21 @@ def main(config: InferenceConfig):
                     inference_queue.put_nowait(None)
                 except queue.Full:
                     pass
+
+            guard_event = sensor_guard.update(time.monotonic(), pause_loop)
+            if guard_event == "pause":
+                pause_loop = True
+                cached_action_chunk = None  # never replay a pre-outage chunk after resume
+                print_red(
+                    f"SENSOR LOSS: no valid observation for {sensor_guard.outage_s:.1f} s (camera view missing "
+                    "or stale, or no robot state) -> policy PAUSED. No actions are sent; the Inspire bridge opens "
+                    "the hands after 2 s. Fix the sensor (head camera: unplug 10 s, replug), then press 'p'."
+                )
+            elif guard_event == "recovered":
+                print_yellow("Observations valid again - policy still PAUSED by the sensor-loss guard. Press 'p' to resume.")
+            elif guard_event == "resume":
+                pause_loop = False
+                print_yellow("Observations valid again - resuming (auto_resume_after_sensor_loss).")
 
             if pause_loop:
                 print("Pausing...", end="", flush=True)
