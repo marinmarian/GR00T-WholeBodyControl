@@ -1500,14 +1500,17 @@ class PoseStreamer:
         left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
             self.reader
         )
+        # Gestures must see the REAL controller grip: in hand-tracking mode get_controller_inputs
+        # returns the thumb curl as grip, and a tracked fist + A would otherwise toggle recording.
+        _, _, _, left_grip_ctrl, _ = _controller_inputs_raw(self.reader)
         # Get A and B button states for data collection control
         a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
 
         # Data collection toggle logic (edge-triggered)
         # Left grip + A = toggle_data_collection
         # Left grip + B = toggle_data_abort
-        toggle_data_collection_tmp = a_pressed and left_grip > 0.5
-        toggle_data_abort_tmp = b_pressed and left_grip > 0.5
+        toggle_data_collection_tmp = a_pressed and left_grip_ctrl > 0.5
+        toggle_data_abort_tmp = b_pressed and left_grip_ctrl > 0.5
 
         # Detect rising edge
         toggle_data_collection = toggle_data_collection_tmp and not self.toggle_data_collection_last
@@ -2203,7 +2206,9 @@ def run_pico_manager(
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            # manager gestures use the raw controller values (hand tracking only replaces trigger/grip
+            # for the hands themselves)
+            left_menu_button, _, _, left_grip_mgr, _ = _controller_inputs_raw(reader)
 
             left_axis_click, right_axis_click = get_axis_clicks(reader)
             episode_keys.update(
