@@ -514,6 +514,9 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
   says `head camera device missing`. Unplug it at the robot, count to 10, replug. The cam-g1 pane restarts the push on
   its own (watchdog loop on g1, since 2026-09-21), the inference pane reports `Observations valid again`, and only
   your `p` resumes the policy. Check the picture is live (image-latency lines for both views) before pressing it.
+  After a replug the camera may come back **without its serial in the `/dev/v4l/by-id` name** (2026-09-22); the
+  launcher matches `usb-Intel_R__RealSense_TM__Depth_Camera_430i_*video-index2` for that reason. If a pane started
+  before that fix still waits, `Ctrl-C` it and paste the `CAMG1_CMD` line printed by `tools/vla-inference.sh camcmd`.
 - **Wrist motors overheat during long hovers.** The policy tends to hold the bottle raised at full reach; the wrist
   motors heat up and fault before placement. `f` in the deploy pane prints motor temperatures — check before each run,
   let the wrists cool between attempts, don't restart while hot.

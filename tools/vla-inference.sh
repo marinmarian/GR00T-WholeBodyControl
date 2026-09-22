@@ -31,16 +31,18 @@ SERVE_CMD="$THOR_RIG/serve_policy.sh $POLICY_MODEL $POLICY_PORT"
 GPU_HOST="${GPU_HOST:-ubuntu@13.40.142.104}"          # darwin-gpu (EC2). Port 5550 is NOT open in its
 TUNNEL_CMD="while true; do ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:${POLICY_PORT}:127.0.0.1:5550 ${GPU_HOST}; echo 'tunnel dropped, retrying in 3s'; sleep 3; done"
 CAM_COLOR=/dev/v4l/by-id/usb-Remo_Tech_Co.__Ltd._OBSBOT_Tiny_2_Lite-video-index0
-CAM_G1=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_Intel_R__RealSense_TM__Depth_Camera_430i_349623061587-video-index2
-GST_G1="gst-launch-1.0 v4l2src device=$CAM_G1 ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"
+# The D430i sometimes re-enumerates WITHOUT its serial in the by-id name (seen 2026-09-22 after a replug), so the
+# watchdog matches by glob and resolves the node each time it (re)starts the push. index2 = left IR stream.
+CAM_G1_GLOB='/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_*video-index2'
+GST_G1_TAIL="! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"
 # Head-camera watchdog (issue #26): runs ON g1 inside one ssh session. Waits for the D430i device node, starts
 # the push, and restarts it when it exits or the camera drops off the USB bus. Safe now because the VLA client
 # pauses itself after 1 s without a valid observation and stays paused until 'p' (it used to resume unprompted).
 # -tt gives the remote loop a pty so killing the pane hangs it up; up/down also pkill the HEADCAM_WATCHDOG marker.
-headcam_push_cmd() {   # $1 device node, $2 gst pipeline  -> remote bash command (no single quotes inside)
-  echo "HEADCAM_WATCHDOG=1; while true; do until [ -e $1 ]; do echo \"[\$(date +%T)] head camera device missing - D430i off the USB bus? unplug 10 s, replug\"; sleep 2; done; echo \"[\$(date +%T)] head camera present, starting push\"; $2; echo \"[\$(date +%T)] head push exited, retrying in 2 s (VLA client pauses itself on sensor loss; press p to resume)\"; sleep 2; done"
+headcam_push_cmd() {   # $1 device glob, $2 gst pipeline after "v4l2src device=<node>"  -> remote bash command (no single quotes inside)
+  echo "HEADCAM_WATCHDOG=1; while true; do DEV=\$(ls $1 2>/dev/null | head -1); until [ -n \"\$DEV\" ]; do echo \"[\$(date +%T)] head camera device missing - D430i off the USB bus? unplug 10 s, replug\"; sleep 2; DEV=\$(ls $1 2>/dev/null | head -1); done; echo \"[\$(date +%T)] head camera present at \$DEV, starting push\"; gst-launch-1.0 v4l2src device=\$DEV $2; echo \"[\$(date +%T)] head push exited, retrying in 2 s (VLA client pauses itself on sensor loss; press p to resume)\"; sleep 2; done"
 }
-CAMG1_CMD="ssh -tt g1 '$(headcam_push_cmd "$CAM_G1" "$GST_G1")'"
+CAMG1_CMD="ssh -tt g1 '$(headcam_push_cmd "$CAM_G1_GLOB" "$GST_G1_TAIL")'"
 # --autostart: capture + ZMQ tee run without a PICO Remote Vision session (headset optional).
 CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt MJPG --width 1280 --height 720 --fps 30 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555 --autostart'
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
@@ -125,5 +127,6 @@ status)
   ss -ltn 2>/dev/null | grep -E ":5550 |:5555 |:5556 |:5557 |:5558 |:5580 " | awk '{print "  listening", $4}'
   pgrep -af "run_vla_inferenc[e]|inspire_vla_bridg[e]|OrinVideoSenderI[R]|g1_deploy_onnx_re[f]|run_gr00t_serve[r]" | cut -c1-120
   ;;
-*) echo "usage: $0 up|down|status"; exit 1 ;;
+camcmd) echo "$CAMG1_CMD" ;;                              # paste into the svc cam-g1 pane after Ctrl-C to restart the head push by hand
+*) echo "usage: $0 up|down|status|camcmd"; exit 1 ;;
 esac
