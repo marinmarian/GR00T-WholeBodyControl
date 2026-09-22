@@ -251,11 +251,15 @@ def process_single_dataset(
     remove_discarded: bool = False,
     episode_index_offset: int = 0,
     exclude_episodes: set[int] | None = None,
+    task_index_remap: dict[int, int] | None = None,
 ) -> dict:
     """Process one dataset: optionally clean stale SMPL frames.
 
     Returns stats dict and the list of (parquet_df, video_paths, episode_meta)
     tuples for merging.
+
+    ``task_index_remap`` maps this dataset's ``task_index`` values onto the output
+    dataset's ``tasks.jsonl`` (see ``merge_tasks_meta``); every row must resolve.
     """
     info = load_info(dataset_path)
     episodes_meta = load_episodes_meta(dataset_path)
@@ -301,6 +305,17 @@ def process_single_dataset(
         ep_len = len(df)
         stats["total_frames"] += ep_len
 
+        if task_index_remap is not None and "task_index" in df.columns:
+            mapped = df["task_index"].map(task_index_remap)
+            if mapped.isna().any():
+                unknown = sorted(set(df["task_index"][mapped.isna()].tolist()))
+                print(
+                    f"ERROR: episode {ep_idx} of {dataset_path} uses task_index {unknown} "
+                    "which is not in its meta/tasks.jsonl — corrupt dataset."
+                )
+                raise SystemExit(1)
+            df["task_index"] = mapped.astype(df["task_index"].dtype)
+
         valid_indices = None
 
         if remove_stale_smpl and SMPL_POSE_COLUMN in df.columns:
@@ -344,6 +359,32 @@ def process_single_dataset(
         })
 
     return stats, processed_episodes, info
+
+
+def merge_tasks_meta(dataset_paths: list[Path]) -> tuple[list[dict], dict[Path, dict[int, int]]]:
+    """Merge the inputs' ``tasks.jsonl`` by task STRING.
+
+    Returns the output ``tasks.jsonl`` rows (first-seen order, indices 0..n-1) and,
+    per input dataset, the ``task_index`` remap to apply to its parquet rows. Two
+    sessions that recorded the same prompts in a different order (per-episode
+    prompts, g1-vr-teleop #40) must not end up relabelled: deduplicating by
+    ``task_index`` alone did exactly that (g1-vr-teleop #41).
+    """
+    merged: dict[str, int] = {}
+    remaps: dict[Path, dict[int, int]] = {}
+    for ds in dataset_paths:
+        remap: dict[int, int] = {}
+        for task in load_tasks_meta(ds):
+            if "task_index" not in task or "task" not in task:
+                print(f"ERROR: malformed row in {ds / 'meta' / 'tasks.jsonl'}: {task}")
+                raise SystemExit(1)
+            text = task["task"]
+            if text not in merged:
+                merged[text] = len(merged)
+            remap[int(task["task_index"])] = merged[text]
+        remaps[ds] = remap
+    tasks_meta = [{"task_index": i, "task": text} for text, i in merged.items()]
+    return tasks_meta, remaps
 
 
 def write_output_dataset(
@@ -544,15 +585,9 @@ def main(cfg: ProcessDatasetConfig):
         info = load_info(dataset_paths[0])
         script_config = info.get("script_config")
 
-    # Collect tasks from all datasets (deduplicated)
-    all_tasks_meta: list[dict] = []
-    seen_task_ids: set = set()
-    for ds in dataset_paths:
-        for task in load_tasks_meta(ds):
-            tid = task.get("task_index", id(task))
-            if tid not in seen_task_ids:
-                all_tasks_meta.append(task)
-                seen_task_ids.add(tid)
+    # Merge tasks by string; rows are remapped onto the merged tasks.jsonl. In-place
+    # runs leave tasks.jsonl untouched, so their rows are not remapped either.
+    all_tasks_meta, task_remaps = merge_tasks_meta(dataset_paths)
 
     # Process each dataset
     all_episodes = []
@@ -577,6 +612,7 @@ def main(cfg: ProcessDatasetConfig):
             remove_discarded=cfg.remove_discarded,
             episode_index_offset=len(all_episodes),
             exclude_episodes=set(cfg.exclude_episodes),
+            task_index_remap=None if in_place else task_remaps[ds_path],
         )
 
         if reference_info is None:
