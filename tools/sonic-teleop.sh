@@ -61,8 +61,10 @@ if [ "${EXPORTER:-zmq}" = "ros2" ]; then
   RECORD_HELP='c=start/stop+save x=discard g/v/b=rate | PICO: right-stick click tap=c, hold 1.5s=x, A+Y=c'
 else
   EXPORTER_CMD='~/wbc-marin-exec.sh python gear_sonic/scripts/run_data_exporter.py --camera-host 127.0.0.1 --camera-port 5555 --dataset-name '"${DATASET:-g1_sonic}"' --task-prompt "'"${TASK:-whole_body_teleop}"'" --add-head-camera --upload-bucket-path '"${DATASET_BUCKET:-darwin-robot-data}"' --no-text-to-speech'
-  KEYS_CMD='~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys_zmq.py'
-  RECORD_HELP='PICO: left grip + A = start/stop+save, left grip + B = discard | or c/x in the KEYS pane'
+  # PROMPT_TEMPLATE: prompt behind digits 1-9 in the KEYS pane (one per tic-tac-toe cell,
+  # applies to the NEXT episode; g1-vr-teleop #40). 0 restores $TASK.
+  KEYS_CMD='~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys_zmq.py --base-prompt "'"${TASK:-whole_body_teleop}"'"'"${PROMPT_TEMPLATE:+ --prompt-template \"$PROMPT_TEMPLATE\"}"
+  RECORD_HELP='PICO: left grip + A = start/stop+save, left grip + B = discard | or c/x in the KEYS pane; 1-9 = cell prompt for the NEXT episode, 0 = $TASK'
 fi
 XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service already running" || DISPLAY=:0 ~/start_xrsvc.sh'
 

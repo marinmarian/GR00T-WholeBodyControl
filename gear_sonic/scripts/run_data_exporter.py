@@ -17,6 +17,12 @@ Virtual environment setup (run from repo root):
 Usage (from repo root):
     python gear_sonic/scripts/run_data_exporter.py --task-prompt "pick up the cup"
     python gear_sonic/scripts/run_data_exporter.py --task-prompt "walk forward" --dataset-name my_session
+
+The prompt can be changed per episode without restarting: publish ``prompt:<text>``
+on the ZMQ keys port (5580; tools/record_keys_zmq.py digits 1-9 do this for the
+tic-tac-toe cells). While IDLE it applies at once, while an episode is open it is
+queued for the next one. ``Started recording N: "<prompt>"`` in this pane is the
+proof of which prompt an episode carries.
 """
 
 from collections import deque
@@ -51,6 +57,7 @@ from gear_sonic.data.features_sonic_vla import (
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
+from gear_sonic.utils.data_collection.runtime_prompt import RuntimePrompt
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity, quat_to_rot6d
@@ -82,7 +89,7 @@ class SonicDataExporterConfig:
     """Dataset name (auto-generated if creating new)."""
 
     task_prompt: str = "demo"
-    """Language task prompt."""
+    """Language task prompt (initial; ``prompt:<text>`` on the keys port changes it per episode)."""
 
     root_output_dir: str = "outputs"
     """Root output directory."""
@@ -284,6 +291,7 @@ class GrootDataCollector:
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
+        self._runtime_prompt = RuntimePrompt(data_exporter.task)
 
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
 
@@ -514,9 +522,28 @@ class GrootDataCollector:
 
         self.latest_proprio_msg = msg
 
+    def _apply_prompt_message(self, msg: str) -> None:
+        """``prompt:<text>`` from the keys port: new task string for the next episode."""
+        recording = self._episode_state.get_state() != self._episode_state.IDLE
+        note = self._runtime_prompt.on_message(msg, recording=recording)
+        if note:
+            self._print_and_say(note, say=False)
+        # Unchanged while an episode is open (the prompt is queued), so always safe.
+        self.data_exporter.task = self._runtime_prompt.active
+
+    def _promote_pending_prompt(self) -> None:
+        """Episode saved or discarded: a prompt queued during it becomes active."""
+        note = self._runtime_prompt.on_episode_closed()
+        if note:
+            self.data_exporter.task = self._runtime_prompt.active
+            self._print_and_say(note, say=False)
+
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
         key = self._keyboard_listener.read_msg()
+        if RuntimePrompt.parse(key) is not None:
+            self._apply_prompt_message(key)
+            key = None
 
         if self._manager_toggle_da:
             key = "x"
@@ -530,7 +557,9 @@ class GrootDataCollector:
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
                 self._print_and_say(
-                    f"Started recording {self.current_episode_index}", blocking=False
+                    f"Started recording {self.current_episode_index}: "
+                    f'"{self.data_exporter.task}"',
+                    blocking=False,
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
@@ -542,6 +571,7 @@ class GrootDataCollector:
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
+                self._promote_pending_prompt()
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -763,6 +793,7 @@ class GrootDataCollector:
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
+            self._promote_pending_prompt()
         return True
 
     def _add_data_frame(self):

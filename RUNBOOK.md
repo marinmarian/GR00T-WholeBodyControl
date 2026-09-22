@@ -97,8 +97,16 @@ on this stack — see the ROS 2 entry in Troubleshooting.
 - **left grip + B** = discard while recording
 - Or type `c` / `x` in the KEYS pane (`tools/record_keys_zmq.py`, publishes on
   ZMQ 5580). No ratings on this path: `g`/`v`/`b` do nothing.
-- `Started recording 0` in the **exporter** pane is the only proof it took. The
-  KEYS pane echoing a key means nothing on its own.
+- **Prompt per episode** (tic-tac-toe, g1-vr-teleop #40): digits `1`-`9` in the KEYS
+  pane set the prompt for the **next** episode to the matching cell (reading order:
+  1 = top left … 5 = center … 9 = bottom right, template `PROMPT_TEMPLATE`, default
+  `put a white piece in the {cell} cell`); `0` restores `$TASK`. While idle the change
+  applies at once, while an episode is open it is queued until that episode is saved
+  or discarded — an episode never carries two prompts. Each prompt becomes a row in
+  `meta/tasks.jsonl`; the exporter stores only the row index per frame.
+- `Started recording 0: "<prompt>"` in the **exporter** pane is the only proof it
+  took, and of which prompt the episode carries. The KEYS pane echoing a key means
+  nothing on its own.
 - Episodes: `~/GR00T-WholeBodyControl/outputs/<dataset>/` (LeRobot v2.1: parquet
   + `ego_view` and `head_view` videos, both 640x480 @ 50 fps).
 - Each saved episode uploads to `s3://$DATASET_BUCKET/raw/<dataset>/` (default
@@ -203,9 +211,11 @@ docker start wbc-marin
 ~/wbc-marin-exec.sh python gear_sonic/scripts/run_data_exporter.py \
   --camera-host 127.0.0.1 --camera-port 5555 --dataset-name my_dataset \
   --task-prompt "describe the task" --no-text-to-speech
-# separate terminal — optional, only so c/x can be typed instead of using the
-# controller (left grip + A / left grip + B work without it):
-~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys_zmq.py
+# separate terminal — optional for c/x (left grip + A / left grip + B work without
+# it), required to change the prompt per episode: digits 1-9 = cell prompt, 0 = the
+# base prompt; --line-mode adds `t <text>` for free text (Enter after each command).
+~/wbc-marin-exec.sh python /workspace/wbc/tools/record_keys_zmq.py \
+  --base-prompt "describe the task" [--prompt-template "put a white piece in the {cell} cell"] [--line-mode]
 ```
 This exporter has **no ROS 2 dependency**: robot state and `robot_config` come
 from the C++ deploy's ZMQ output (`g1_debug` topic, port 5557 — verified carrying
