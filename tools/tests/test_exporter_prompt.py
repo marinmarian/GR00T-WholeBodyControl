@@ -81,9 +81,10 @@ assert c._finalize_frame(time.monotonic()) is True
 assert st.get_state() == st.IDLE
 assert ex.saved == [(0, A)]
 assert ex.task == B and c._runtime_prompt.pending is None
-# discard path: episode 1 with B, prompt C queued, x -> discarded with B, C active
+# discard path: episode 1 with B and some frames, prompt C queued, x -> discarded with B, C active
 tick("c", f"prompt:{C_}")
 assert ex.task == B
+ex.episode_buffer["size"] = 5
 tick("x")
 assert st.get_state() == st.IDLE and ex.discarded == [(1, B)] and ex.task == C_
 # PICO start gesture in the same tick as a prompt message: the prompt is read first
@@ -104,4 +105,52 @@ assert ex.saved[-1] == (2, A) and ex.task == B and st.get_state() == st.IDLE
 # c / x / junk never touch the prompt
 tick("zzz")
 assert ex.task == B
+
+
+# --- 2026-09-23 crash: discard with an empty buffer, and loop-error recovery -----------------
+class StrictExporter(FakeExporter):
+    """save_episode_as_discarded raises on an empty buffer, like lerobot's validate_episode_buffer."""
+
+    def __init__(self, task):
+        super().__init__(task)
+        self.resets = 0
+
+    def save_episode_as_discarded(self):
+        if self.episode_buffer["size"] == 0:
+            raise ValueError("You must add one or several frames with `add_frame` before calling `add_episode`.")
+        super().save_episode_as_discarded()
+
+    def skip_and_start_new_episode(self):
+        self.resets += 1
+        self.episode_buffer = {"episode_index": self.episode_buffer["episode_index"], "size": 0}
+
+
+ex = c.data_exporter = StrictExporter(B)
+c._runtime_prompt = RuntimePrompt(B)
+idx0 = ex.episode_buffer["episode_index"]
+# x while recording with no frames: back to IDLE, nothing saved, no exception, queued prompt promoted
+tick("c", f"prompt:{A}")
+assert st.get_state() == st.RECORDING and ex.episode_buffer["size"] == 0
+tick("x")
+assert st.get_state() == st.IDLE and ex.discarded == [] and ex.saved == []
+assert ex.episode_buffer["episode_index"] == idx0 and ex.task == A
+# x with frames still discards
+tick("c"); ex.episode_buffer["size"] = 7; tick("x")
+assert ex.discarded == [(idx0, A)] and st.get_state() == st.IDLE
+# loop error while recording with frames: episode kept as discarded, IDLE, prompt promoted
+tick("c", f"prompt:{B}"); ex.episode_buffer["size"] = 4
+c._recover_from_loop_error(RuntimeError("boom"))
+assert st.get_state() == st.IDLE and ex.discarded[-1] == (idx0 + 1, A) and ex.task == B
+# loop error while recording with no frames: buffer reset, no save
+tick("c"); assert ex.episode_buffer["size"] == 0
+c._recover_from_loop_error(ValueError("empty"))
+assert st.get_state() == st.IDLE and ex.resets == 1 and len(ex.discarded) == 2
+# loop error while idle: nothing to do but stay alive
+c._recover_from_loop_error(RuntimeError("idle boom"))
+assert st.get_state() == st.IDLE and ex.resets == 1
+# a failing discard inside the recovery is swallowed too
+ex.episode_buffer["size"] = 2
+ex.save_episode_as_discarded = lambda: (_ for _ in ()).throw(OSError("disk full"))
+tick("c"); c._recover_from_loop_error(RuntimeError("boom2"))
+assert st.get_state() == st.IDLE
 print("EXPORTER_PROMPT_TEST_OK")

@@ -121,7 +121,11 @@ up)
   tmux send-keys -t "$P_DEP" "$DEPLOY_ENTER" C-m
   ( sleep 12; tmux send-keys -t "$P_DEP" "$DEPLOY_RUN" C-m ) &
   P_EXP=$(tmux split-window -t "$P_STR" -v -P -F '#{pane_id}')
-  tmux send-keys -t "$P_EXP" "docker start wbc-marin >/dev/null 2>&1; sleep 3; $EXPORTER_CMD" C-m
+  # The exporter pane is the only proof of what got recorded ("Started recording N", "Waiting for
+  # message", tracebacks), so keep a copy: `script` records the pane to logs/exporter-last-run.log
+  # while leaving the exporter its tty (docker exec -it, Ctrl-C).
+  EXP_Q=${EXPORTER_CMD//\'/\'\\\'\'}   # single-quote-safe copy for `script -c '...'`
+  tmux send-keys -t "$P_EXP" "docker start wbc-marin >/dev/null 2>&1; sleep 3; mkdir -p ~/GR00T-WholeBodyControl/logs; script -qfc '$EXP_Q' ~/GR00T-WholeBodyControl/logs/exporter-last-run.log" C-m
   P_KEY=$(tmux split-window -t "$P_DEP" -v -P -F '#{pane_id}')
   tmux send-keys -t "$P_KEY" "docker start wbc-marin >/dev/null 2>&1; sleep 5; $KEYS_CMD" C-m
   tmux select-window -t $S:run

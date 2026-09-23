@@ -32,6 +32,7 @@ import json
 from pathlib import Path
 import threading
 import time
+import traceback
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -567,10 +568,18 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                self.data_exporter.save_episode_as_discarded()
+                # Nothing to save when no frame ever arrived (camera or state missing):
+                # lerobot's validate_episode_buffer raises on an empty buffer and that
+                # killed the exporter mid-session on 2026-09-23.
+                if self.data_exporter.episode_buffer.get("size", 0) > 0:
+                    self.data_exporter.save_episode_as_discarded()
+                    self._print_and_say("Discarded episode", blocking=False)
+                else:
+                    self._print_and_say(
+                        "Discarded episode: no frames were collected, nothing to save", say=False
+                    )
                 self._episode_state.reset_state()
                 self._initial_yaw = None
-                self._print_and_say("Discarded episode", blocking=False)
                 self._promote_pending_prompt()
 
     def _poll_sonic_zmq_messages(self):
@@ -1114,29 +1123,64 @@ class GrootDataCollector:
 
         self._print_and_say("Shutting down data exporter...", say=False)
 
+    def _recover_from_loop_error(self, exc: BaseException) -> None:
+        """One bad tick must not end the recording session.
+
+        Before 2026-09-23 any exception in the loop killed the exporter (only
+        KeyboardInterrupt was caught) and every later PICO gesture went nowhere. Log
+        the traceback, keep whatever frames the open episode has (saved as discarded,
+        so nothing is lost and the video writers are closed), drop an empty buffer, and
+        go back to IDLE with the queued prompt promoted.
+        """
+        traceback.print_exception(exc)
+        note = "no episode open"
+        if self._episode_state.get_state() != self._episode_state.IDLE:
+            idx = self.data_exporter.episode_buffer.get("episode_index")
+            try:
+                if self.data_exporter.episode_buffer.get("size", 0) > 0:
+                    self.data_exporter.save_episode_as_discarded()
+                    note = f"episode {idx} saved as discarded"
+                else:
+                    self.data_exporter.skip_and_start_new_episode()
+                    note = f"episode {idx} had no frames, buffer reset"
+            except Exception as exc2:  # noqa: BLE001 - last resort, still keep running
+                traceback.print_exception(exc2)
+                note = f"episode {idx} could not be saved; check the dataset before recording more"
+        self._episode_state.reset_state()
+        self._initial_yaw = None
+        self._promote_pending_prompt()
+        self._print_and_say(
+            f"[Exporter] {type(exc).__name__}: {exc} -- {note}; back to IDLE, still running",
+            say=False,
+        )
+
     def run(self):
         try:
             while True:
                 t_start = time.monotonic()
-                with self.telemetry.timer("total_loop"):
-                    with self.telemetry.timer("poll_state"):
-                        self._poll_state_zmq()
+                try:
+                    with self.telemetry.timer("total_loop"):
+                        with self.telemetry.timer("poll_state"):
+                            self._poll_state_zmq()
 
-                    with self.telemetry.timer("poll_sonic"):
-                        self._poll_sonic_zmq_messages()
+                        with self.telemetry.timer("poll_sonic"):
+                            self._poll_sonic_zmq_messages()
 
-                    with self.telemetry.timer("poll_image"):
-                        img_msg = self._image_subscriber.read()
-                        if img_msg is not None:
-                            self.latest_image_msg = img_msg
+                        with self.telemetry.timer("poll_image"):
+                            img_msg = self._image_subscriber.read()
+                            if img_msg is not None:
+                                self.latest_image_msg = img_msg
 
-                    with self.telemetry.timer("add_frame"):
-                        self._add_data_frame()
+                        with self.telemetry.timer("add_frame"):
+                            self._add_data_frame()
 
-                    with self.telemetry.timer("check_recording_commands"):
-                        self._check_recording_commands()
-
-                    end_time = time.monotonic()
+                        with self.telemetry.timer("check_recording_commands"):
+                            self._check_recording_commands()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - see _recover_from_loop_error
+                    self._recover_from_loop_error(exc)
+                end_time = time.monotonic()
 
                 elapsed = time.monotonic() - t_start
                 sleep_time = self.loop_period - elapsed
