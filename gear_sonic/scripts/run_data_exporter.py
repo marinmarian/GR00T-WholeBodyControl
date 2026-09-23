@@ -809,12 +809,16 @@ class GrootDataCollector:
         t_start = time.monotonic()
 
         if self.latest_proprio_msg is None or self.latest_image_msg is None:
-            self._print_and_say(
-                f"Waiting for message. "
-                f"Avail msg: proprio {self.latest_proprio_msg is not None} | "
-                f"image {self.latest_image_msg is not None}",
-                say=False,
-            )
+            # Once per second, not once per 20 ms tick: 2026-09-23's log had 32k of these.
+            now = time.monotonic()
+            if now - getattr(self, "_last_waiting_print", 0.0) >= 1.0:
+                self._last_waiting_print = now
+                self._print_and_say(
+                    f"Waiting for message. "
+                    f"Avail msg: proprio {self.latest_proprio_msg is not None} | "
+                    f"image {self.latest_image_msg is not None}",
+                    say=False,
+                )
             return False
 
         if self._episode_state.get_state() != self._episode_state.RECORDING:

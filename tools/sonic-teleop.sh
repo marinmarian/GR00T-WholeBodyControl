@@ -35,7 +35,11 @@ DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model
 # Head IR is pushed from g1 to mjolnir over RTP (5600 = composite's right half,
 # 5601 = the dataset head_view recorder); the OBSBOT + composite sender run here.
 CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"'
-CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt MJPG --width 1280 --height 720 --fps 30 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555'
+# --autostart: capture + the ZMQ 5555 recording tee run from launch, not only during a
+# headset Remote Vision session (2026-09-23: the tee sat silent until the headset connected,
+# and a silently dead pipeline left the exporter without images). The headset reconnecting
+# restarts the pipeline and the tee follows; verified live the same day.
+CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt MJPG --width 1280 --height 720 --fps 30 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555 --autostart'
 # Episode recording. EXPORTER=zmq (default) or EXPORTER=ros2.
 #
 # zmq  - gear_sonic/scripts/run_data_exporter.py. State + robot_config come from
