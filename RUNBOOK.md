@@ -124,8 +124,22 @@ on this stack — see the ROS 2 entry in Troubleshooting.
   a different size. Safe to re-run; it never deletes.
 - Still no episode ratings (`g`/`v`/`b`) and no `raw/`+`recorded/` quality split
   on this path — those are ROS 2 exporter features.
-- Keep Remote Vision open while recording: camera frames only flow during a
-  live headset video session.
+- **Camera frames flow from launch** (sender started with `--autostart`, 2026-09-23): the
+  ZMQ 5555 recording tee no longer waits for a headset Remote Vision session. Opening
+  Remote Vision restarts the capture pipeline for the headset and the tee follows within
+  a second. Do **not** close Remote Vision mid-episode: `CLOSE_CAMERA` tears the pipeline
+  and the tee down with it (see gotchas).
+- **Pre-flight, before the first gesture:** the exporter pane must have stopped printing
+  `Waiting for message. Avail msg: proprio X | image Y` (once per second). `image False` =
+  nothing on the tee: look at the sender pane (`svc` window); the OBSBOT parks its gimbal
+  far off centre when it sleeps (`tilt_absolute` in the 100000s) — re-centre it with
+  `v4l2-ctl -d /dev/video0 -c pan_absolute=0,tilt_absolute=0,zoom_absolute=0` and restart
+  the sender pane if the tee stays silent. `proprio False` = the deploy's control loop is
+  not running yet: the robot has to be started (`A+B+X+Y`) before state reaches the exporter.
+- The exporter pane is recorded to `logs/exporter-last-run.log` (both launchers); read it
+  after `down` when a session produced fewer episodes than expected. Half-initialised
+  datasets (meta only) must be removed before relaunching with the same `DATASET`:
+  `docker exec wbc-marin rm -rf /workspace/wbc/outputs/<dataset>`.
 
 ---
 
@@ -179,8 +193,12 @@ spends minutes building TensorRT engines.
 cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 \
   --device /dev/v4l/by-id/usb-Remo_Tech_Co.__Ltd._OBSBOT_Tiny_2_Lite-video-index0 \
   --pixfmt MJPG --width 1280 --height 720 --fps 30 \
-  --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555
+  --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555 --autostart
 ```
+`--autostart` runs the capture and the ZMQ tee from start-up instead of waiting for the
+headset's OPEN_CAMERA (default in both launchers since 2026-09-23). The sender has no
+GStreamer bus watch: a pipeline that dies keeps the pane quiet, so an empty tee with the
+OBSBOT enumerated means "restart this pane", not "check the camera".
 The OBSBOT (UVC webcam, `video-index0`; `index1` is its metadata node) only offers
 raw YUYV at 640x480, so we take its **MJPEG** 720p mode — `--pixfmt MJPG` makes the
 sender insert a software `jpegdec` (`nvjpegdec` rejects this camera's stream) before
