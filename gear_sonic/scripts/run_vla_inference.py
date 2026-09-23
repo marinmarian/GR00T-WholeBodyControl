@@ -21,6 +21,13 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   c  -> start recording (handled by data exporter if running)
   s  -> stop recording success (handled by data exporter)
   f  -> stop recording failure (handled by data exporter)
+
+Relay mode (``--relay``, DAgger interventions, g1-vr-teleop #25): the PICO streamer owns the
+deploy's input socket (5556) and relays this client's ``pose`` messages while it is in
+StreamMode.POLICY. This client then binds its action PUB on ``--action-zmq-port`` (5576), sends
+no C++ start/stop commands (k/x only print), and follows ``manager_state.stream_mode`` on 5556:
+it yields while the operator intervenes (VR_3PT) and resumes on its own when POLICY mode
+returns, blending from the deploy's last encoder token. See gear_sonic/utils/teleop/policy_relay.py.
 """
 
 from dataclasses import dataclass
@@ -42,6 +49,13 @@ from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.teleop.policy_relay import (
+    DEFAULT_POLICY_ACTION_PORT,
+    STREAM_MODE_NAMES,
+    RelayArbiter,
+    resume_blend_token,
+    unpack_pose_message,
+)
 from gear_sonic.utils.teleop.inspire.inspire_dump import (
     INSPIRE_DUMP_HOST,
     INSPIRE_DUMP_PORT,
@@ -146,6 +160,33 @@ class InferenceConfig:
     auto_resume_after_sensor_loss: bool = False
     """Resume on its own once observations are valid again. Default False: stay paused until the
     operator presses 'p' (2026-09-11 the robot resumed unprompted when the head camera came back)."""
+
+    # Recording (g1-vr-teleop #25)
+    exporter_keys: bool = False
+    """An episode exporter shares the keys channel (RECORD=1 in tools/vla-inference.sh): c = start /
+    stop+save and x = DISCARD are its keys, so x does not stop the C++ loop here. Stop it with O
+    in the deploy pane instead."""
+
+    # Relay through the PICO streamer (DAgger interventions, g1-vr-teleop #25)
+    relay: bool = False
+    """Publish actions for the PICO streamer's POLICY mode instead of driving the deploy directly.
+    The streamer (pico_manager_thread_server.py --manager --policy-port <action_zmq_port>) owns
+    5556 and relays our ``pose`` messages while in POLICY mode. Here: bind the action PUB on
+    ``action_zmq_port`` (use 5576, not the streamer's 5556), send no C++ start/stop commands
+    (k/x are the streamer's job), and follow ``manager_state.stream_mode`` on ``manager_zmq_port``:
+    yield while the operator intervenes (VR_3PT), resume when POLICY mode returns."""
+
+    manager_zmq_host: str = "localhost"
+    manager_zmq_port: int = 5556
+    """The streamer's PUB (manager_state topic) in relay mode."""
+
+    manager_timeout_s: float = 2.0
+    """Relay mode: no manager_state for this long -> treat as yielded, no auto-resume."""
+
+    resume_blend_s: float = 0.5
+    """Relay mode: after an intervention, blend from the deploy's last token (g1_debug
+    token_state = what the encoder produced under the operator) to the policy's tokens over this
+    many seconds so the hand-back does not jump. 0 = snap."""
 
     # Debug
     verbose_timing: bool = False
@@ -578,18 +619,59 @@ def main(config: InferenceConfig):
         server_ip=config.camera_host, port=config.camera_port
     )
 
+    if config.relay and config.action_zmq_port == 5556:
+        raise SystemExit(
+            "--relay: 5556 is the PICO streamer's socket; bind the action PUB elsewhere "
+            f"(--action-zmq-port {DEFAULT_POLICY_ACTION_PORT}, the streamer's --policy-port)"
+        )
+
     zmq_context = zmq.Context()
     zmq_socket = zmq_context.socket(zmq.PUB)
     zmq_socket.bind(f"tcp://{config.action_zmq_host}:{config.action_zmq_port}")
     time.sleep(0.1)
     print_green(
         f"ZMQ action socket bound to tcp://{config.action_zmq_host}:{config.action_zmq_port}"
+        + (" (RELAY: the PICO streamer forwards these in POLICY mode)" if config.relay else "")
     )
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
 
     keyboard_listener = ZMQKeyboardSubscriber(
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
     )
+
+    # Relay mode: follow the streamer's stream_mode, and read the deploy's last token for the
+    # resume blend on a socket of our own (the worker thread owns state_subscriber's).
+    manager_sub = None
+    arbiter = None
+    token_state_sub = None
+    if config.relay:
+        manager_sub = zmq_context.socket(zmq.SUB)
+        manager_sub.setsockopt(zmq.SUBSCRIBE, b"manager_state")
+        manager_sub.setsockopt(zmq.RCVHWM, 16)
+        manager_sub.connect(f"tcp://{config.manager_zmq_host}:{config.manager_zmq_port}")
+        arbiter = RelayArbiter(manager_timeout_s=config.manager_timeout_s)
+        token_state_sub = ZMQStateSubscriber(host=config.state_zmq_host, port=config.state_zmq_port)
+        print_green(
+            f"Relay mode: following manager_state on tcp://{config.manager_zmq_host}:{config.manager_zmq_port}; "
+            "k/x do nothing here (the streamer starts/stops the deploy); the policy yields during "
+            f"interventions and resumes by itself (blend {config.resume_blend_s:.1f} s)"
+        )
+
+    def read_stream_mode():
+        """Latest manager_state.stream_mode from the streamer, or None if nothing new."""
+        mode = None
+        for _ in range(32):
+            try:
+                raw = manager_sub.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            try:
+                data = unpack_pose_message(raw, topic="manager_state")
+            except Exception:  # noqa: BLE001
+                continue
+            if "stream_mode" in data:
+                mode = int(np.asarray(data["stream_mode"]).flat[0])
+        return mode
 
     telemetry = Telemetry(window_size=100)
 
@@ -690,6 +772,12 @@ def main(config: InferenceConfig):
     def send_cpp_control_command(start: bool, planner: bool = False):
         """Send C++ control loop start/stop commands via ZMQ."""
         nonlocal cpp_loop_running, cpp_mode
+        if config.relay:
+            print_yellow(
+                "Relay mode: the PICO streamer owns the deploy - start/stop it there "
+                "(A+B+X+Y), enter POLICY mode with g; nothing sent."
+            )
+            return False
         try:
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
             zmq_socket.send(cmd_msg)
@@ -716,6 +804,11 @@ def main(config: InferenceConfig):
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
+
+    # Resume blend after an intervention (relay mode)
+    blend_start_token: np.ndarray | None = None
+    blend_step = 0
+    blend_steps = max(0, round(config.action_publish_rate * config.resume_blend_s))
 
     PROMPT_MSG_PREFIX = "prompt:"
 
@@ -746,6 +839,11 @@ def main(config: InferenceConfig):
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
+            if config.relay and arbiter.yielded:
+                print_yellow(
+                    f"Relay mode: streamer is in {STREAM_MODE_NAMES.get(arbiter.mode, arbiter.mode)}, "
+                    "not POLICY - the initial pose tokens are dropped there (g in the keys pane first)"
+                )
             if cpp_loop_running and cpp_mode == "PLANNER":
                 if send_cpp_control_command(start=True, planner=False):
                     print("Switched to POSE mode (from PLANNER mode)")
@@ -765,6 +863,15 @@ def main(config: InferenceConfig):
             action_chunk_index = 0
             print("Cleared cached action chunk, reset frame counter")
         elif key == "p":
+            if config.relay and arbiter.yielded:
+                # Not our robot right now: p only decides what happens when POLICY mode returns.
+                arbiter.set_resume_intent(not arbiter.was_running)
+                print_yellow(
+                    "Relay mode: yielded to the streamer "
+                    f"({STREAM_MODE_NAMES.get(arbiter.mode, arbiter.mode)}); the policy will "
+                    f"{'RESUME' if arbiter.was_running else 'stay PAUSED'} when POLICY mode returns"
+                )
+                return
             pause_loop = not pause_loop
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
             if pause_loop:
@@ -784,6 +891,8 @@ def main(config: InferenceConfig):
                 print("Press 'i' to send initial pose and switch to POSE mode")
                 if pause_loop:
                     print("Note: Policy loop is paused - press 'p' to resume")
+        elif key == "x" and config.exporter_keys:
+            print("Keyboard: 'x' (discard episode -- handled by data exporter; O in the deploy pane stops the C++ loop)")
         elif key == "x":
             current_planner = cpp_mode == "PLANNER"
             print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
@@ -853,6 +962,47 @@ def main(config: InferenceConfig):
         while True:
             t_start = time.monotonic()
             check_keyboard_input()
+
+            if arbiter is not None:
+                relay_event = arbiter.update(read_stream_mode(), time.monotonic(), pause_loop)
+                if relay_event == "yield":
+                    was_running = arbiter.was_running
+                    pause_loop = True
+                    cached_action_chunk = None  # never replay a pre-intervention chunk
+                    blend_start_token = None
+                    mode_name = STREAM_MODE_NAMES.get(arbiter.mode, arbiter.mode)
+                    if was_running:
+                        print_yellow(
+                            f"INTERVENTION: streamer switched to {mode_name} - policy yielded, no actions "
+                            "sent; resumes by itself when POLICY mode returns (p while yielded flips that)."
+                        )
+                    else:
+                        print_yellow(f"Streamer in {mode_name}: waiting for POLICY mode (g in the keys pane).")
+                elif relay_event == "resume":
+                    pause_loop = False
+                    cached_action_chunk = None
+                    sensor_guard.operator_resumed()
+                    blend_start_token = None
+                    if blend_steps > 0:
+                        st = token_state_sub.get_msg(clear=True)
+                        tok = None if st is None else st.get("token_state")
+                        if tok is not None and np.asarray(tok).size == 64:
+                            blend_start_token = np.asarray(tok, dtype=np.float32).reshape(64)
+                            blend_step = 0
+                    print_green(
+                        "POLICY mode is back - resuming with a fresh chunk"
+                        + (f", blending from the deploy's last token over {config.resume_blend_s:.1f} s"
+                           if blend_start_token is not None else " (no token_state to blend from: snap)")
+                    )
+                elif relay_event == "handover":
+                    print_yellow("Streamer in POLICY mode: our tokens reach the deploy now. i = initial pose, p = run.")
+                elif relay_event == "lost":
+                    pause_loop = True
+                    cached_action_chunk = None
+                    print_red(
+                        f"No manager_state from the streamer for {config.manager_timeout_s:.0f} s - policy PAUSED. "
+                        "Is pico_manager_thread_server.py --policy-port running? p resumes once it is back."
+                    )
 
             # Consume result first so last_inference_time is fresh before trigger check
             try:
@@ -948,6 +1098,14 @@ def main(config: InferenceConfig):
                     if right_hand_joints.ndim == 2:
                         right_hand_joints = right_hand_joints[current_idx]
 
+                    if blend_start_token is not None:
+                        blend_step += 1
+                        motion_token = resume_blend_token(
+                            blend_start_token, motion_token, blend_step, blend_steps
+                        )
+                        if blend_step >= blend_steps:
+                            blend_start_token = None
+
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
 
@@ -986,6 +1144,10 @@ def main(config: InferenceConfig):
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
         zmq_socket.close()
+        if manager_sub is not None:
+            manager_sub.close()
+        if token_state_sub is not None:
+            token_state_sub.close()
         zmq_context.term()
         state_subscriber.close()
         keyboard_listener.close()

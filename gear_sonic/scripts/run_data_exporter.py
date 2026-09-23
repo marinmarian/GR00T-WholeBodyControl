@@ -23,6 +23,14 @@ on the ZMQ keys port (5580; tools/record_keys_zmq.py digits 1-9 do this for the
 tic-tac-toe cells). While IDLE it applies at once, while an episode is open it is
 queued for the next one. ``Started recording N: "<prompt>"`` in this pane is the
 proof of which prompt an episode carries.
+
+Policy episodes / DAgger (g1-vr-teleop #25): when the ``pose`` topic carries VLA tokens
+(protocol v4, from run_vla_inference.py directly or relayed by the PICO streamer in its POLICY
+mode) the frames are labelled stream_mode 6 instead of carrying SMPL poses; ``action.motion_token`` still comes from the deploy's ``token_state`` (the token
+it executed) and ``teleop.*_hand_joints`` from the relayed hand action. An intervention is
+stream_mode 5 (PLANNER_VR_3PT) inside such an episode. Nothing else changes: the per-frame
+``teleop.stream_mode`` column is the label; ``process_dataset.py --intervention-segments``
+cuts the corrections out afterwards. Each saved episode prints its stream-mode summary.
 """
 
 from collections import deque
@@ -71,6 +79,11 @@ from gear_sonic.utils.teleop.inspire.inspire_dump import (
     INSPIRE_DUMP_PORT,
     InspireHandStateSubscriber,
     inspire_actual_to_g1_hand_q,
+)
+from gear_sonic.utils.teleop.policy_relay import (
+    POLICY_STREAM_MODE,
+    format_stream_mode_summary,
+    stream_mode_summary,
 )
 from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
@@ -301,6 +314,13 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        # VLA action (protocol v4 ``pose``): relayed by the streamer in POLICY mode, or straight
+        # from run_vla_inference.py when it owns 5556 itself (plain closed-loop run, #25)
+        self.latest_policy_msg = None
+        self._manager_state_seen = False
+        self._policy_source_announced = False
+        # teleop.stream_mode of every frame of the open episode -> summary at save time
+        self._episode_stream_modes: list[int] = []
 
         self.current_stream_mode = 0
 
@@ -557,9 +577,11 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
+                self._episode_stream_modes = []
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}: "
-                    f'"{self.data_exporter.task}"',
+                    f'"{self.data_exporter.task}"'
+                    + (" [POLICY episode]" if self.current_stream_mode == POLICY_STREAM_MODE else ""),
                     blocking=False,
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
@@ -580,6 +602,7 @@ class GrootDataCollector:
                     )
                 self._episode_state.reset_state()
                 self._initial_yaw = None
+                self._episode_stream_modes = []
                 self._promote_pending_prompt()
 
     def _poll_sonic_zmq_messages(self):
@@ -609,6 +632,7 @@ class GrootDataCollector:
 
         if "stream_mode" in data:
             self.current_stream_mode = int(data["stream_mode"].flat[0])
+            self._manager_state_seen = True
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
@@ -667,6 +691,28 @@ class GrootDataCollector:
             pose_data = unpack_pose_message(raw, topic="pose")
         except Exception as e:
             print(f"[Sonic] Error unpacking pose message: {e}")
+            return
+
+        if "token_state" in pose_data:
+            # Protocol v4 from run_vla_inference.py, relayed by the streamer in POLICY mode.
+            self.latest_policy_msg = {
+                "left_hand_joints": self._extract_hand_joints(pose_data, "left_hand_joints"),
+                "right_hand_joints": self._extract_hand_joints(pose_data, "right_hand_joints"),
+                "frame_index": (
+                    np.array([pose_data["frame_index"].flat[0]], dtype=np.int64)
+                    if "frame_index" in pose_data else None
+                ),
+                "receive_timestamp": time.time(),
+            }
+            if not self._manager_state_seen:
+                # No streamer on this stack: the token source IS the policy. Label the frames
+                # as POLICY so hand actions are recorded and process_dataset keeps them
+                # (zero smpl_pose is normal here, not a dropout).
+                self.current_stream_mode = POLICY_STREAM_MODE
+                if not self._policy_source_announced:
+                    self._policy_source_announced = True
+                    print("[Sonic] VLA tokens on the pose topic and no streamer manager_state: "
+                          f"recording frames as stream_mode {POLICY_STREAM_MODE} (POLICY)", flush=True)
             return
 
         try:
@@ -798,9 +844,15 @@ class GrootDataCollector:
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
                 self._print_and_say("Finished saving episode")
+                self._print_and_say(
+                    f"Episode {saved_index} stream modes: "
+                    f"{format_stream_mode_summary(stream_mode_summary(self._episode_stream_modes))}",
+                    say=False,
+                )
                 self._upload_episode(saved_index)
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
+            self._episode_stream_modes = []
             self._episode_state.change_state()
             self._promote_pending_prompt()
         return True
@@ -928,6 +980,7 @@ class GrootDataCollector:
         sonic_latency_ms = None
 
         frame_data["teleop.stream_mode"] = np.array([self.current_stream_mode], dtype=np.int32)
+        self._episode_stream_modes.append(int(self.current_stream_mode))
 
         smpl_msg = self.latest_sonic_msg
         use_smpl = False
@@ -1007,8 +1060,20 @@ class GrootDataCollector:
             else np.array([0], dtype=np.int64)
         )
 
+        policy_msg = self.latest_policy_msg
+        use_policy = False
+        if self.current_stream_mode == POLICY_STREAM_MODE and policy_msg is not None:
+            age_sec = time.time() - policy_msg["receive_timestamp"]
+            if sonic_latency_ms is None:
+                sonic_latency_ms = age_sec * 1000
+            # The client publishes at 50 Hz while running; paused = no fresh action = open hands
+            # (the Inspire bridge does the same after its action-max-age).
+            use_policy = age_sec <= 0.2
+
         hand_msg = (
             smpl_msg if self.current_stream_mode in (1, 4) and smpl_msg is not None
+            else policy_msg if use_policy
+            else None if self.current_stream_mode == POLICY_STREAM_MODE
             else planner_msg if planner_msg is not None
             else smpl_msg
         )
@@ -1152,6 +1217,7 @@ class GrootDataCollector:
                 note = f"episode {idx} could not be saved; check the dataset before recording more"
         self._episode_state.reset_state()
         self._initial_yaw = None
+        self._episode_stream_modes = []
         self._promote_pending_prompt()
         self._print_and_say(
             f"[Exporter] {type(exc).__name__}: {exc} -- {note}; back to IDLE, still running",

@@ -514,14 +514,126 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
   says `head camera device missing`. Unplug it at the robot, count to 10, replug. The cam-g1 pane restarts the push on
   its own (watchdog loop on g1, since 2026-09-21), the inference pane reports `Observations valid again`, and only
   your `p` resumes the policy. Check the picture is live (image-latency lines for both views) before pressing it.
-  After a replug the camera may come back **without its serial in the `/dev/v4l/by-id` name** (2026-09-22); the
-  launcher matches `usb-Intel_R__RealSense_TM__Depth_Camera_430i_*video-index2` for that reason. If a pane started
-  before that fix still waits, `Ctrl-C` it and paste the `CAMG1_CMD` line printed by `tools/vla-inference.sh camcmd`.
 - **Wrist motors overheat during long hovers.** The policy tends to hold the bottle raised at full reach; the wrist
   motors heat up and fault before placement. `f` in the deploy pane prints motor temperatures — check before each run,
   let the wrists cool between attempts, don't restart while hot.
 - **Policy round trip 0.4–0.5 s in the real runs** (bench: 0.25 s): two raw 640x480 frames per request through the
   office uplink. Sending JPEGs is the planned fix; until then expect hesitant motion.
+
+### Recording closed-loop attempts as episodes (`RECORD=1`, 2026-09-23, issue #25)
+
+```bash
+RECORD=1 DATASET=policy_2026-09-23 ~/GR00T-WholeBodyControl/tools/vla-inference.sh up   # + POLICY_MODEL, PROMPT as usual
+```
+Same stack as above plus the ZMQ exporter (wbc-marin container, `--add-head-camera`, S3 upload to
+`s3://$DATASET_BUCKET/raw/$DATASET/`) and `record_keys_zmq.py` in the keys pane instead of `vla_keys.py`.
+No headset, no streamer. **Every key needs Enter** (line mode): `k` start C++ loop, `i` initial pose, `p`
+run/pause, `c` start episode / stop+save, `x` DISCARD the open episode (it no longer stops the C++ loop —
+use `O` in the deploy pane for that), `t <text>` prompt of exporter *and* client, `1`-`9` cell prompts.
+
+What lands in the dataset: identical schema to the teleop recordings. `action.motion_token` = the token the
+deploy executed (the policy's), `teleop.*_hand_joints` = the policy's hand action, `observation.state` hands
+from the Inspire bridge's dump port as in teleop, both camera views. Every frame has `teleop.stream_mode` 6
+(POLICY): the exporter sees VLA tokens on the `pose` topic and no streamer `manager_state`, and says so once
+(`recording frames as stream_mode 6 (POLICY)`). SMPL columns are zero by construction; `process_dataset.py`
+keeps such frames (`--keep-zero-smpl-modes 5 6`), so the usual cleaning + merge works on these datasets.
+Proof an episode took: `Started recording N: "<prompt>" [POLICY episode]` in the exporter pane, and the
+`Episode N stream modes: 1234 frames: POLICY 1234 (100%)` line after `c` again.
+
+**Verified on the robot 2026-09-23**: 3 episodes (`outputs/policy_2026-09-23`, 7,899 frames), all POLICY-labelled,
+tokens and hand actions populated, videos matching the parquets, all files in S3 — see `docs/EXPERIMENTS.md`.
+Unit tests: `tools/tests/test_exporter_policy_mode.py`.
+
+### DAgger: record policy attempts and intervene from the PICO (experimental, 2026-09-22, issue #25)
+
+**Not yet verified on the robot.** Everything below is implemented and unit-tested against the C++
+deploy's ZMQ protocol as read from its source; the first live run has to confirm the two mode
+switches (see the checklist at the end). Run it on the hoist.
+
+**What it does.** `DAGGER=1 tools/vla-inference.sh up` is `RECORD=1` (above) *plus* the PICO
+streamer. Every closed-loop attempt is recorded as a LeRobot episode, and the
+operator wearing the headset can take the arms and hands over at any moment (an *intervention*), then hand
+back to the policy. Per frame the dataset says who was in control: `teleop.stream_mode` 6 = policy,
+5 = human intervention (`PLANNER_VR_3PT`). `action.motion_token` is the token the deploy executed in
+both cases (the policy's, or the SONIC encoder's output under the operator), so intervention frames are
+training data in the same action space. `process_dataset.py --intervention-segments` cuts the corrections
+out afterwards (DAgger = aggregate them into the training set and fine-tune again).
+
+**Why it is wired this way.** The deploy takes one ZMQ input source (5556) and locks the `pose` protocol
+version per streaming session: v3 SMPL poses (teleop) and v4 tokens (policy) cannot alternate, a change
+makes it leave streaming mode "for safety". So:
+
+| piece | role in DAGGER mode |
+|---|---|
+| PICO streamer (`--policy-port 5576 --keys-port 5580`) | owns 5556. New `StreamMode.POLICY` (6): relays the VLA client's v4 `pose` messages to the deploy unchanged; its Inspire bridge drives the hands from the relayed hand joints. Intervention = the existing `PLANNER_VR_3PT` mode (deploy in PLANNER mode, upper body from the VR wrists, recalibrated onto the robot's **measured** joints at the moment of the take-over so nothing jumps). Back to POLICY = deploy back to STREAMED mode, which also resets the protocol lock. |
+| `run_vla_inference.py --relay --action-zmq-port 5576` | publishes tokens for the streamer instead of the deploy; `k`/`x` do nothing (the streamer starts/stops the deploy); follows `manager_state.stream_mode`: yields during an intervention, resumes by itself when POLICY returns *if it was running*, blending 0.5 s from the deploy's last token (`--resume-blend-s`). |
+| exporter (container) | unchanged schema; in mode 6 `teleop.*_hand_joints` come from the relayed action; prints the stream-mode summary of every saved episode (`POLICY 1234 (81%), PLANNER_VR_3PT 290 (19%); 2 intervention segment(s)`). |
+| keys pane (`record_keys_zmq.py --line-mode --passthrough-keys "pigh[]"`) | one pane for all three: `c`/`x` episode, `p`/`i`/`[`/`]` VLA client, `g`/`h` streamer, `t <text>` prompt of exporter **and** client, `1`-`9` cell prompts. **Every key needs Enter.** |
+| `inspire_vla_bridge.py` | not started; the streamer's bridge does the hands in every mode. |
+
+**Run**
+
+```bash
+sudo -v
+DAGGER=1 DATASET=policy_2026-09-22 ~/GR00T-WholeBodyControl/tools/vla-inference.sh up   # + POLICY_MODEL, PROMPT, INSPIRE_HANDS as usual
+tmux attach -t vla
+```
+Run window: deploy (top-left) | inference (top-right) | streamer (mid-left) | exporter (bottom-right) |
+keys (bottom-left). `svc` window has xr-service in addition to serve / cam-g1 / cam-sender.
+
+Headset: PC service 10.42.0.1, **Full body + Send** (the intervention needs body tracking for the 3-point
+pose), ankle trackers not needed, Remote Vision open **before** `g` and kept open (closing it kills the
+camera tee). Operator in the calibration pose.
+
+| step | who | do | expect |
+|---|---|---|---|
+| 1 | | wait for serve (model loaded), deploy `Init Done`, inference `PolicyServer is reachable` + both camera views, streamer past `waiting for body data`, exporter `Recording to outputs/<dataset>` | inference pane: `Streamer in OFF: waiting for POLICY mode` |
+| 2 | PICO | **A+B+X+Y** (brief) | robot stands under the planner (`PLANNER`, 3-point calibration captured). |
+| 3 | keys | `g` ⏎ | streamer `StreamMode switch: PLANNER -> POLICY`, deploy `Switched to: STREAMED MOTION mode`, inference `Streamer in POLICY mode: our tokens reach the deploy now`. Robot holds still (encoder on the frozen pose until tokens arrive). |
+| 4 | keys | `i` ⏎ then `p` ⏎ | initial pose blend, then the policy drives; deploy prints `Protocol version 4 established`. |
+| 5 | keys | `c` ⏎ | exporter `Started recording N: "<prompt>" [POLICY episode]`. |
+| 6 | PICO | **left-stick click** (or B+X, or `h` ⏎) when the policy is failing or about to | streamer `INTERVENTION: operator has the upper body`, inference `INTERVENTION: ... policy yielded`. Your wrists now steer the arms from where the robot's arms are (no jump); triggers close the hands. Sticks = planner locomotion, avoid them. |
+| 7 | PICO | same gesture again | streamer `intervention over: back to POLICY mode`, inference `POLICY mode is back - resuming with a fresh chunk, blending ...`. |
+| 8 | keys | `c` ⏎ (save) or `x` ⏎ (discard) | exporter summary line with the mode percentages and the number of intervention segments. Repeat from 4/5 (use `i` between attempts). |
+
+`p` while yielded does not move anything: it flips whether the policy resumes when POLICY mode returns
+(the pane says which). `A+X` = back to PLANNER (the client yields); `A+B+X+Y` = stop everything as in teleop;
+`O` in the deploy pane = e-stop. `down` sends Ctrl-C to every pane first (streamer opens the hands, exporter
+saves and finishes uploads).
+
+**Post-processing.** Clean as usual (policy / VR_3PT frames have zero `teleop.smpl_pose` by design and are
+no longer removed as stale, `--keep-zero-smpl-modes 5 6`), then cut the corrections:
+```bash
+~/wbc-marin-exec.sh python gear_sonic/scripts/process_dataset.py \
+  --dataset-path outputs/policy_2026-09-22 --output-path outputs/policy_2026-09-22_corrections \
+  --intervention-segments --intervention-preroll-s 1.0      # one episode per correction + 1 s of policy lead-in
+# --keep-episodes-without-interventions keeps clean autonomous successes whole
+```
+Then merge with the demonstrations (`--dataset-path <demos> <corrections> --output-path <merged>`) and
+fine-tune. The processor prints per-episode mode counts and a `DAgger:` summary line.
+
+**Gotchas / to verify live**
+- Two mode switches per intervention (STREAMED→PLANNER→STREAMED). Each is a C++ safety reset: the robot
+  holds its pose for the switch. On the way back the deploy must accept v4 again after the reset
+  (`Protocol version 4 established` a second time). If instead it prints `Protocol version changed ...
+  Exiting ZMQ streaming mode`, the lock did not reset — stop (`A+B+X+Y`) and report; nothing else in this
+  section is safe until that is fixed.
+- The first VR_3PT frames follow the *recalibrated* wrists. The recalibration reads `body_q` from
+  `g1_debug` (it used to look only for `body_q_measured` and silently fell back to a zero pose, i.e. a jump —
+  fixed in this branch). Watch the streamer pane for `VR 3PT recalibration scheduled with measured robot pose`.
+- Interventions record the SONIC encoder's tokens in VR-3-point mode; the demonstrations were POSE mode
+  (SMPL encoder mode). Same decoder and latent space, possibly a different token distribution — check the
+  first fine-tune on corrections open-loop before trusting it.
+- Hands: in POLICY mode they follow the relayed action (open after 2 s without one, like the VLA bridge); in
+  VR_3PT the triggers. During the switch the hands keep their last command.
+- The VLA client's sensor-loss guard still applies; `Streamer ... lost` after 2 s without `manager_state`
+  pauses it (streamer died?). The exporter needs `robot_config` from the deploy before it records, as always.
+- `g` before `A+B+X+Y` is ignored (`robot not started`); `h` only from POLICY / VR_3PT.
+
+### Status (2026-09-23)
+
+**Closed-loop attempts are recorded as LeRobot episodes** (`RECORD=1`, verified 2026-09-23, 3 episodes, #25).
+Interventions from the PICO (`DAGGER=1`) are implemented and unit-tested, not yet run on the robot.
 
 ### Status (2026-09-16)
 

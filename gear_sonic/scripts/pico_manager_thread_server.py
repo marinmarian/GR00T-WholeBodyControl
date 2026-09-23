@@ -37,6 +37,12 @@ import torch
 import zmq
 
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
+from gear_sonic.utils.teleop.policy_relay import (
+    DEFAULT_POLICY_ACTION_PORT,
+    POLICY_STREAM_MODE,
+    PolicyRelay,
+)
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
@@ -131,6 +137,9 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+    # The VLA client's motion tokens are relayed to the deploy (DAgger, g1-vr-teleop #25).
+    # Interventions = PLANNER_VR_3PT entered from here; see gear_sonic/utils/teleop/policy_relay.py.
+    POLICY = POLICY_STREAM_MODE
 
 
 ### Parse 3 point pose from SMPL
@@ -1840,26 +1849,36 @@ class FeedbackReader:
             return None, None, None, None
 
         unpacked = msgpack.unpackb(data, raw=False)
+        return self.targets_from_feedback(unpacked, self.upper_body_joint_indices)
+
+    @staticmethod
+    def targets_from_feedback(
+        unpacked: dict, upper_body_joint_indices: list[int]
+    ) -> tuple[list | None, list | None, list | None, np.ndarray | None]:
+        """(upper_body_q, left_hand_q, right_hand_q, full_body_q) from one g1_debug dict.
+
+        ``body_q_measured`` / ``*_hand_q_measured`` are the deploy's visualisation fields and are
+        only present when its output map is populated; ``body_q`` / ``*_hand_q`` are always
+        streamed (same values, MuJoCo order). Without the fallback the VR_3PT recalibration ran
+        on an all-zero pose and the arms jumped on the first intervention frame.
+        """
+        body_q_swizzled = unpacked.get("body_q_measured")
+        if body_q_swizzled is None:
+            body_q_swizzled = unpacked.get("body_q")
         full_body_q = None
-        if "body_q_measured" in unpacked:
-            body_q_swizzled = unpacked["body_q_measured"]
+        if body_q_swizzled is not None and len(body_q_swizzled) == 29:
             full_body_q = np.array(body_q_swizzled, dtype=np.float64)
-            body_q = [body_q_swizzled[i] for i in self.upper_body_joint_indices]
+            body_q = [body_q_swizzled[i] for i in upper_body_joint_indices]
         else:
-            print("[PlannerLoop] body_q_measured not in feedback data")
+            print("[PlannerLoop] neither body_q_measured nor a 29-DoF body_q in feedback data")
             body_q = None
 
-        if "left_hand_q_measured" in unpacked:
-            left_hand_q = unpacked["left_hand_q_measured"]
-        else:
-            print("[PlannerLoop] left_hand_q_measured not in feedback data")
-            left_hand_q = None
-
-        if "right_hand_q_measured" in unpacked:
-            right_hand_q = unpacked["right_hand_q_measured"]
-        else:
-            print("[PlannerLoop] right_hand_q_measured not in feedback data")
-            right_hand_q = None
+        left_hand_q = unpacked.get("left_hand_q_measured", unpacked.get("left_hand_q"))
+        if left_hand_q is None:
+            print("[PlannerLoop] no left hand q in feedback data")
+        right_hand_q = unpacked.get("right_hand_q_measured", unpacked.get("right_hand_q"))
+        if right_hand_q is None:
+            print("[PlannerLoop] no right hand q in feedback data")
 
         return body_q, left_hand_q, right_hand_q, full_body_q
 
@@ -2072,14 +2091,25 @@ def run_pico_manager(
     vr3pt_scale: float = 1.0,
     vr3pt_clamp: float = 0.0,
     vr3pt_smooth: float = 0.0,
+    policy_port: int = 0,
+    keys_port: int = 0,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
+
+    ``policy_port`` > 0 enables StreamMode.POLICY (DAgger, g1-vr-teleop #25): the VLA client's
+    action PUB on that port is relayed to the deploy while in POLICY mode, and the Inspire
+    hands follow the relayed hand joints. ``keys_port`` > 0 reads the ZMQ keys channel
+    (record_keys_zmq.py / vla_keys.py): ``g`` = POLICY mode on/off, ``h`` = intervention on/off.
     """
     reader = _init_input_source(input_source, buffer_size, use_adb=use_adb)
+
+    # Current StreamMode, readable from the Inspire bridge thread (list = mutable cell).
+    mode_ref = [StreamMode.OFF]
+    policy_relay: PolicyRelay | None = None
 
     # --inspire-hands handtracking: trigger/grip come from the PICO hand tracking (finger curl ->
     # trigger, thumb curl -> grip); buttons and sticks stay on the controllers. Falls back to the
@@ -2119,9 +2149,21 @@ def run_pico_manager(
         except Exception as e:  # noqa: BLE001 - hands must keep working without it
             print(f"[Manager] Inspire dump publisher unavailable (hand state not "
                   f"recorded): {e}", flush=True)
-        inspire_bridge = InspireBridge(
-            get_inputs=lambda: get_controller_inputs(reader), **bridge_kwargs
-        )
+        # In POLICY mode the hands follow the relayed policy hand joints, not the controllers
+        # (policy_relay is created below; mode_ref is updated by the manager loop).
+        def _hand_inputs():
+            if mode_ref[0] == StreamMode.POLICY and policy_relay is not None:
+                return policy_relay.hand_inputs()
+            return get_controller_inputs(reader)
+
+        if inspire_hands == "handtracking":
+            # per-DOF hand-tracking targets must not override the policy's hand action
+            _ht_targets = bridge_kwargs.get("get_targets")
+            if _ht_targets is not None:
+                bridge_kwargs["get_targets"] = (
+                    lambda: {} if mode_ref[0] == StreamMode.POLICY else _ht_targets()
+                )
+        inspire_bridge = InspireBridge(get_inputs=_hand_inputs, **bridge_kwargs)
         inspire_bridge.start()
 
     context = zmq.Context()
@@ -2129,6 +2171,53 @@ def run_pico_manager(
     socket.bind(f"tcp://*:{port}")
     time.sleep(0.1)
     print(f"[Manager] ZMQ socket bound to port {port}")
+
+    policy_sub = None
+    if policy_port:
+        policy_sub = context.socket(zmq.SUB)
+        policy_sub.setsockopt(zmq.SUBSCRIBE, b"pose")
+        policy_sub.setsockopt(zmq.RCVHWM, 64)
+        policy_sub.connect(f"tcp://localhost:{policy_port}")
+
+        def _policy_recv():
+            try:
+                return policy_sub.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                return None
+
+        # Hand joints -> Inspire closures, the inverse of the exporter's inspire_actual_to_g1_hand_q.
+        closure_fn = None
+        if G1GripperInverseKinematicsSolver is not None:
+            from gear_sonic.utils.teleop.inspire.inspire_dump import (
+                G1_HAND_FINGER_SLOTS,
+                G1_HAND_THUMB_SLOTS,
+            )
+
+            _open_q, _closed_q = {}, {}
+            for _side in ("left", "right"):
+                _solver = G1GripperInverseKinematicsSolver(side=_side)
+                _tips = np.zeros([25, 4, 4])
+                _tips[4, 0, 3] = 1.0  # thumb tip (generate_finger_data)
+                _open_q[_side] = np.asarray(_solver({"position": _tips}), dtype=np.float64).reshape(-1)
+                _tips[14, 0, 3] = 1.0  # middle tip -> closed grip
+                _closed_q[_side] = np.asarray(_solver({"position": _tips}), dtype=np.float64).reshape(-1)
+
+            def closure_fn(side, q7, _o=_open_q, _c=_closed_q):
+                span = _c[side] - _o[side]
+
+                def ratio(slots):
+                    vals = [(q7[k] - _o[side][k]) / span[k] for k in slots if abs(span[k]) > 1e-6]
+                    return float(np.clip(np.mean(vals), 0.0, 1.0)) if vals else 0.0
+
+                return ratio(G1_HAND_FINGER_SLOTS), ratio(G1_HAND_THUMB_SLOTS)
+
+        policy_relay = PolicyRelay(recv=_policy_recv, send=socket.send, closure_fn=closure_fn)
+        print(f"[Manager] POLICY mode available: relaying tcp://localhost:{policy_port} (pose/v4) "
+              f"-> deploy while in POLICY mode; hands follow the policy there", flush=True)
+
+    keys_sub = ZMQKeyboardSubscriber(port=keys_port) if keys_port else None
+    if keys_sub is not None:
+        print(f"[Manager] keys channel :{keys_port}: g = POLICY mode on/off, h = intervention on/off", flush=True)
 
     # Print available locomotion modes
     try:
@@ -2185,6 +2274,9 @@ def run_pico_manager(
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    if policy_relay is not None:
+        print("POLICY mode (DAgger): g = enter/leave (keys pane); intervene with left-stick click / B+X "
+              "or h (keys pane), same again hands back to the policy; A+X = PLANNER; A+B+X+Y = stop")
     print(
         "Recording: right-stick click tap=c (start/stop+save), "
         "hold 1.5s=x (discard); A+Y held=c"
@@ -2239,6 +2331,25 @@ def run_pico_manager(
                 else:
                     globals()["_last_combo_t"] = _now_combo
 
+            # Keys channel (g1-vr-teleop #25): g toggles POLICY mode, h toggles an intervention.
+            key_policy_toggle = False
+            key_intervene_toggle = False
+            if keys_sub is not None:
+                _key = keys_sub.read_msg()
+                if _key == "g":
+                    key_policy_toggle = True
+                elif _key == "h":
+                    key_intervene_toggle = True
+            if (key_policy_toggle or key_intervene_toggle) and policy_relay is None:
+                print("[Manager] POLICY mode is off (start the streamer with --policy-port)")
+                key_policy_toggle = key_intervene_toggle = False
+            if key_policy_toggle and current_mode == StreamMode.OFF:
+                print("[Manager] robot not started (A+B+X+Y first) - ignoring g")
+                key_policy_toggle = False
+            if key_intervene_toggle and current_mode not in (StreamMode.POLICY, StreamMode.PLANNER_VR_3PT):
+                print(f"[Manager] h only toggles an intervention from POLICY/VR_3PT (now {current_mode.name})")
+                key_intervene_toggle = False
+
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
@@ -2286,18 +2397,32 @@ def run_pico_manager(
                     new_mode = StreamMode.POSE
 
             elif current_mode == StreamMode.PLANNER_VR_3PT:
-                # VR_3PT is reachable from both chains:
-                #   left_axis_click → return to parent (PLANNER or FROZEN)
+                # VR_3PT is reachable from both chains and from POLICY (intervention):
+                #   left_axis_click / h → return to parent (PLANNER, FROZEN or POLICY)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
+                elif (left_axis_click and not prev_left_axis_click) or key_intervene_toggle:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
+
+            elif current_mode == StreamMode.POLICY:
+                # Policy drives the robot through the relay. Intervention = VR_3PT with POLICY as
+                # parent (left-stick click / B+X / h), back the same way. A+X leaves to PLANNER.
+                if start_combo and not prev_start_combo:
+                    new_mode = StreamMode.OFF
+                elif (left_axis_click and not prev_left_axis_click) or key_intervene_toggle:
+                    new_mode = StreamMode.PLANNER_VR_3PT
+                elif (ax_pressed and not prev_ax_pressed) or key_policy_toggle:
+                    new_mode = StreamMode.PLANNER
+
+            # g from any running mode -> POLICY (from POLICY it went to PLANNER above)
+            if key_policy_toggle and current_mode not in (StreamMode.OFF, StreamMode.POLICY):
+                new_mode = StreamMode.POLICY
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
@@ -2327,10 +2452,30 @@ def run_pico_manager(
                     # Recalibrate VR tracking against the robot's actual current pose
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
                     planner_streamer.recalibrate_for_vr3pt()
+                    if current_mode == StreamMode.POLICY:
+                        print("[Manager] INTERVENTION: operator has the upper body (VR_3PT); "
+                              "left-stick click / B+X / h hands back to the policy", flush=True)
+                elif new_mode == StreamMode.POLICY:
+                    # Drop tokens queued while we were not relaying: the deploy must not replay them.
+                    policy_relay.reset()
+                    if current_mode == StreamMode.PLANNER_VR_3PT:
+                        print("[Manager] intervention over: back to POLICY mode (the VLA client resumes "
+                              "on its own if it was running)", flush=True)
+                    else:
+                        print("[Manager] POLICY mode: deploy -> STREAMED (v4 tokens); the VLA client's "
+                              "i / p apply from here", flush=True)
+                    planner_streamer.reset_yaw()
+
+            # Keep the relay queue drained in every mode; only POLICY forwards (stale tokens
+            # must never reach the deploy when POLICY mode returns).
+            if policy_relay is not None:
+                policy_relay.pump(active=(new_mode == StreamMode.POLICY))
 
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
+            elif new_mode == StreamMode.POLICY:
+                time.sleep(MANAGER_POLL_PERIOD_S)  # the relay above did the work this tick
             elif (
                 new_mode == StreamMode.PLANNER
                 or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2349,11 +2494,14 @@ def run_pico_manager(
                     or new_mode == StreamMode.PLANNER_VR_3PT
                 ):
                     socket.send(build_command_message(start=True, stop=False, planner=True))
-                elif new_mode == StreamMode.POSE:
+                elif new_mode == StreamMode.POSE or new_mode == StreamMode.POLICY:
+                    # STREAMED mode on the deploy: leaving PLANNER triggers its safety reset and
+                    # resets the pose-protocol lock, so v3 (POSE) or v4 (POLICY) is accepted next.
                     socket.send(build_command_message(start=True, stop=False, planner=False))
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
+            mode_ref[0] = current_mode
 
             # Mode-independent: send manager_state for data exporter.
             # Left grip + A = start/stop+save, left grip + B = discard.
@@ -2416,6 +2564,10 @@ def run_pico_manager(
             inspire_bridge.stop()
         reader.stop()
         three_point.close()
+        if keys_sub is not None:
+            keys_sub.close()
+        if policy_sub is not None:
+            policy_sub.close()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")
@@ -2571,6 +2723,25 @@ if __name__ == "__main__":
         default=None,
         help="Right Inspire hand IP (default 192.168.123.211)",
     )
+    parser.add_argument(
+        "--policy-port",
+        type=int,
+        default=0,
+        help=(
+            "Enable StreamMode.POLICY (DAgger, g1-vr-teleop #25): relay run_vla_inference.py's "
+            f"action PUB on this port (it uses --relay --action-zmq-port, default {DEFAULT_POLICY_ACTION_PORT}) "
+            "to the deploy while in POLICY mode. 0 = off (default)."
+        ),
+    )
+    parser.add_argument(
+        "--keys-port",
+        type=int,
+        default=0,
+        help=(
+            "ZMQ keys channel to read (the exporter's, 5580): g = POLICY mode on/off, "
+            "h = intervention on/off. 0 = off (default)."
+        ),
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2619,6 +2790,8 @@ if __name__ == "__main__":
             vr3pt_scale=args.vr3pt_scale,
             vr3pt_clamp=args.vr3pt_clamp,
             vr3pt_smooth=args.vr3pt_smooth,
+            policy_port=args.policy_port,
+            keys_port=args.keys_port,
         )
     else:
         # Run legacy single-thread pose streaming

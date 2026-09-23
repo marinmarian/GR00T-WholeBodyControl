@@ -47,6 +47,17 @@ Usage:
         --dataset-path outputs/my_dataset \\
         --output-path outputs/my_dataset_cleaned \\
         --remove-discarded
+
+    # DAgger (g1-vr-teleop #25): from policy episodes keep only the operator's corrections
+    # (teleop.stream_mode == 5, PLANNER_VR_3PT) with 1 s of policy lead-in, one output episode
+    # per correction; episodes without a correction are dropped
+    python gear_sonic/scripts/process_dataset.py \\
+        --dataset-path outputs/policy_session \\
+        --output-path outputs/policy_session_corrections \\
+        --intervention-segments --intervention-preroll-s 1.0
+
+Frames whose stream_mode is 5 (VR_3PT) or 6 (POLICY) have an all-zero teleop.smpl_pose by
+design and are never treated as stale SMPL frames (--keep-zero-smpl-modes).
 """
 
 from dataclasses import dataclass, field
@@ -62,6 +73,9 @@ import tyro
 
 
 SMPL_POSE_COLUMN = "teleop.smpl_pose"
+STREAM_MODE_COLUMN = "teleop.stream_mode"
+POLICY_STREAM_MODE = 6         # StreamMode.POLICY: the streamer relays the VLA tokens
+INTERVENTION_STREAM_MODE = 5   # StreamMode.PLANNER_VR_3PT: the operator drives the upper body
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +105,45 @@ def build_stale_mask(smpl_arr: np.ndarray) -> np.ndarray:
                 j -= 1
 
     return remove
+
+
+def stream_modes_of(df: pd.DataFrame) -> np.ndarray | None:
+    """Per-frame teleop.stream_mode as int array, or None for datasets without the column."""
+    if STREAM_MODE_COLUMN not in df.columns:
+        return None
+    return np.asarray([int(np.asarray(x).reshape(-1)[0]) for x in df[STREAM_MODE_COLUMN]], dtype=np.int64)
+
+
+def contiguous_segments(mask: np.ndarray) -> list[tuple[int, int]]:
+    """[start, end) index ranges of the True runs in ``mask``."""
+    m = np.asarray(mask, dtype=bool)
+    if m.size == 0:
+        return []
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], m.astype(np.int8), [0]))))
+    return [(int(edges[i]), int(edges[i + 1])) for i in range(0, len(edges), 2)]
+
+
+def intervention_windows(
+    stream_modes: np.ndarray, preroll_frames: int, mode: int = INTERVENTION_STREAM_MODE
+) -> list[tuple[int, int]]:
+    """One [start, end) window per intervention: the correction plus ``preroll_frames`` of
+    whatever preceded it (policy frames), clipped to the episode. Windows that would overlap
+    after adding the pre-roll are merged so no frame is emitted twice."""
+    segs = contiguous_segments(np.asarray(stream_modes) == mode)
+    windows: list[tuple[int, int]] = []
+    for start, end in segs:
+        start = max(0, start - int(preroll_frames))
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], end)
+        else:
+            windows.append((start, end))
+    return windows
+
+
+def format_mode_counts(stream_modes: np.ndarray) -> str:
+    names = {0: "OFF", 1: "POSE", 2: "PLANNER", 3: "FROZEN", 4: "POSE_PAUSE", 5: "VR_3PT", 6: "POLICY"}
+    modes, counts = np.unique(stream_modes, return_counts=True)
+    return ", ".join(f"{names.get(int(m), int(m))}={int(c)}" for m, c in zip(modes, counts))
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +305,10 @@ def process_single_dataset(
     episode_index_offset: int = 0,
     exclude_episodes: set[int] | None = None,
     task_index_remap: dict[int, int] | None = None,
+    keep_zero_smpl_modes: tuple[int, ...] = (INTERVENTION_STREAM_MODE, POLICY_STREAM_MODE),
+    intervention_segments: bool = False,
+    intervention_preroll_frames: int = 0,
+    keep_episodes_without_interventions: bool = False,
 ) -> dict:
     """Process one dataset: optionally clean stale SMPL frames.
 
@@ -260,6 +317,12 @@ def process_single_dataset(
 
     ``task_index_remap`` maps this dataset's ``task_index`` values onto the output
     dataset's ``tasks.jsonl`` (see ``merge_tasks_meta``); every row must resolve.
+
+    ``keep_zero_smpl_modes``: frames in these stream modes are never "stale SMPL" (their
+    smpl_pose is zero by construction). ``intervention_segments``: emit one output episode per
+    intervention window (stream_mode 5 plus ``intervention_preroll_frames`` before it) and drop
+    the rest of the episode; episodes without interventions are dropped unless
+    ``keep_episodes_without_interventions``.
     """
     info = load_info(dataset_path)
     episodes_meta = load_episodes_meta(dataset_path)
@@ -278,6 +341,10 @@ def process_single_dataset(
         "episodes_dropped": 0,
         "episodes_discarded": 0,
         "episodes_excluded": 0,
+        "intervention_segments": 0,
+        "intervention_frames": 0,
+        "policy_frames": 0,
+        "episodes_without_interventions": 0,
     }
     processed_episodes = []
 
@@ -317,12 +384,26 @@ def process_single_dataset(
             df["task_index"] = mapped.astype(df["task_index"].dtype)
 
         valid_indices = None
+        stream_modes = stream_modes_of(df)
+        if stream_modes is not None:
+            n_int = int((stream_modes == INTERVENTION_STREAM_MODE).sum())
+            n_pol = int((stream_modes == POLICY_STREAM_MODE).sum())
+            stats["intervention_frames"] += n_int
+            stats["policy_frames"] += n_pol
+            n_segs = len(contiguous_segments(stream_modes == INTERVENTION_STREAM_MODE))
+            stats["intervention_segments"] += n_segs
+            if n_pol or n_int:
+                print(f"  Episode {ep_idx}: stream modes {format_mode_counts(stream_modes)}"
+                      + (f" — {n_segs} intervention segment(s)" if n_segs else ""))
 
         if remove_stale_smpl and SMPL_POSE_COLUMN in df.columns:
             smpl_arr = np.vstack(
                 [np.asarray(x, dtype=np.float32) for x in df[SMPL_POSE_COLUMN]]
             )
             mask = build_stale_mask(smpl_arr)
+            if stream_modes is not None and keep_zero_smpl_modes:
+                # zero SMPL is the normal state of policy / VR_3PT frames, not a dropout
+                mask &= ~np.isin(stream_modes, list(keep_zero_smpl_modes))
             n_remove = int(mask.sum())
             n_zero = int(np.all(smpl_arr == 0, axis=1).sum())
             n_frozen = n_remove - n_zero
@@ -347,6 +428,38 @@ def process_single_dataset(
                 df = df.iloc[valid_indices].copy().reset_index(drop=True)
                 if "timestamp" in df.columns:
                     df["timestamp"] -= df["timestamp"].iloc[0]
+
+        if intervention_segments:
+            # Indices below are into the (possibly stale-cleaned) df; map back to source video frames.
+            source_rows = valid_indices if valid_indices is not None else np.arange(len(df))
+            modes_now = stream_modes_of(df)
+            windows = (
+                intervention_windows(modes_now, intervention_preroll_frames)
+                if modes_now is not None else []
+            )
+            if not windows:
+                stats["episodes_without_interventions"] += 1
+                if not keep_episodes_without_interventions:
+                    print(f"  Episode {ep_idx}: no intervention — dropping (--keep-episodes-without-interventions keeps it)")
+                    stats["episodes_dropped"] += 1
+                    continue
+            else:
+                for w_i, (w_start, w_end) in enumerate(windows):
+                    rows = np.arange(w_start, w_end)
+                    sub = df.iloc[rows].copy().reset_index(drop=True)
+                    if "timestamp" in sub.columns:
+                        sub["timestamp"] -= sub["timestamp"].iloc[0]
+                    print(f"  Episode {ep_idx}: intervention window {w_i}: frames {w_start}-{w_end - 1} "
+                          f"({w_end - w_start} frames, {int((modes_now[rows] == INTERVENTION_STREAM_MODE).sum())} corrected)")
+                    processed_episodes.append({
+                        "df": sub,
+                        "source_video_paths": video_paths,
+                        "valid_indices": np.asarray(source_rows)[rows],
+                        "episode_meta": ep_meta,
+                        "new_episode_index": len(processed_episodes) + episode_index_offset,
+                        "fps": fps,
+                    })
+                continue
 
         new_ep_idx = ep_idx + episode_index_offset
         processed_episodes.append({
@@ -530,6 +643,24 @@ class ProcessDatasetConfig:
     merging several datasets these apply to every input, so exclude in separate
     runs if that is not what you want."""
 
+    keep_zero_smpl_modes: list[int] = field(default_factory=lambda: [INTERVENTION_STREAM_MODE, POLICY_STREAM_MODE])
+    """Stream modes whose frames are never removed as stale SMPL (their teleop.smpl_pose is
+    zero by construction): 5 = PLANNER_VR_3PT (interventions), 6 = POLICY. Datasets without a
+    teleop.stream_mode column are unaffected."""
+
+    intervention_segments: bool = False
+    """DAgger (g1-vr-teleop #25): write one output episode per intervention (run of
+    stream_mode 5 frames) plus the pre-roll before it, and drop the rest of each episode.
+    Requires --output-path."""
+
+    intervention_preroll_s: float = 1.0
+    """Seconds of context kept before each intervention (policy frames, so the model sees
+    the state it was in when the operator took over). Overlapping windows are merged."""
+
+    keep_episodes_without_interventions: bool = False
+    """With --intervention-segments: keep episodes that have no intervention whole (e.g.
+    clean autonomous successes) instead of dropping them."""
+
 
 def main(cfg: ProcessDatasetConfig):
     dataset_paths = [Path(p) for p in cfg.dataset_path]
@@ -561,6 +692,10 @@ def main(cfg: ProcessDatasetConfig):
         print("ERROR: --output-path is required when merging multiple datasets.")
         raise SystemExit(1)
 
+    if cfg.intervention_segments and in_place:
+        print("ERROR: --output-path is required with --intervention-segments (episodes are split).")
+        raise SystemExit(1)
+
     output_path = Path(cfg.output_path) if cfg.output_path else dataset_paths[0]
 
     print("=" * 70)
@@ -574,6 +709,9 @@ def main(cfg: ProcessDatasetConfig):
     print(f"  Remove discarded:     {cfg.remove_discarded}")
     if cfg.exclude_episodes:
         print(f"  Exclude episodes:     {sorted(cfg.exclude_episodes)}")
+    if cfg.intervention_segments:
+        print(f"  Intervention segments: yes (pre-roll {cfg.intervention_preroll_s:.2f} s, "
+              f"{'keep' if cfg.keep_episodes_without_interventions else 'drop'} episodes without one)")
     print("=" * 70)
 
     # Validate script configs match across all datasets
@@ -601,11 +739,16 @@ def main(cfg: ProcessDatasetConfig):
         "episodes_dropped": 0,
         "episodes_discarded": 0,
         "episodes_excluded": 0,
+        "intervention_segments": 0,
+        "intervention_frames": 0,
+        "policy_frames": 0,
+        "episodes_without_interventions": 0,
     }
     reference_info = None
 
     for ds_path in dataset_paths:
         print(f"\nProcessing: {ds_path}")
+        fps_ds = load_info(ds_path).get("fps", 50)
         stats, episodes, info = process_single_dataset(
             ds_path,
             remove_stale_smpl=cfg.remove_stale_smpl,
@@ -613,6 +756,10 @@ def main(cfg: ProcessDatasetConfig):
             episode_index_offset=len(all_episodes),
             exclude_episodes=set(cfg.exclude_episodes),
             task_index_remap=None if in_place else task_remaps[ds_path],
+            keep_zero_smpl_modes=tuple(cfg.keep_zero_smpl_modes),
+            intervention_segments=cfg.intervention_segments,
+            intervention_preroll_frames=int(round(cfg.intervention_preroll_s * fps_ds)),
+            keep_episodes_without_interventions=cfg.keep_episodes_without_interventions,
         )
 
         if reference_info is None:
@@ -702,6 +849,12 @@ def main(cfg: ProcessDatasetConfig):
         print(f"    Zero SMPL:       {total_stats['zero_frames']}")
         print(f"    Frozen lead-in:  {total_stats['frozen_leadin_frames']}")
         print(f"    Episodes affected: {total_stats['episodes_with_stale']}")
+    if total_stats["policy_frames"] or total_stats["intervention_frames"]:
+        print(f"  DAgger:    {total_stats['policy_frames']} policy frames, "
+              f"{total_stats['intervention_frames']} intervention frames in "
+              f"{total_stats['intervention_segments']} segment(s)"
+              + (f"; {len(all_episodes)} output episode(s) from the segments"
+                 if cfg.intervention_segments else ""))
     print(f"  Output:    {output_path}")
     print("=" * 70)
 

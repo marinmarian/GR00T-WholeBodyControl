@@ -53,6 +53,8 @@ c._keyboard_listener = FakeKeys()
 c.data_exporter = FakeExporter("demo")
 c._runtime_prompt = RuntimePrompt(c.data_exporter.task)
 c.sonic_timing_monitor = SimpleNamespace(reset=lambda: None)
+c.current_stream_mode = 0          # POLICY-episode tag + per-episode mode list (g1-vr-teleop #25)
+c._episode_stream_modes = []
 
 A, B, C_ = ("put a white piece in the top left cell", "put a white piece in the center cell",
             "put a white piece in the bottom right cell")

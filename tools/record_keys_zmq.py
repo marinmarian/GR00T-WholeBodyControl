@@ -21,6 +21,12 @@ which prompt an episode carries. This pane echoing a key means nothing on its ow
 --line-mode reads whole lines instead of single keys (for free text): `c`, `x`,
 `1`..`9`, `0`, or `t <text>` -> prompt:<text>.
 
+--passthrough-keys KEYS forwards each listed single key unchanged, for the other
+subscribers of the same channel in the DAgger stack (g1-vr-teleop #25):
+run_vla_inference.py (p = run/pause, i = initial pose, [ ] = init-pose hands) and the
+PICO streamer (g = POLICY mode on/off, h = intervention on/off). `t <text>` then changes
+the prompt of the exporter AND the VLA client at once.
+
 Note: unlike the ROS 2 exporter, run_data_exporter.py has no episode ratings, so
 g/v/b do nothing here and are rejected rather than silently dropped.
 """
@@ -52,12 +58,17 @@ def parse_args():
                     help="prompt restored by 0 (pass the exporter's --task-prompt)")
     ap.add_argument("--line-mode", action="store_true",
                     help="read lines with input() instead of single keys; adds `t <text>`")
+    ap.add_argument("--passthrough-keys", default="",
+                    help="single keys forwarded unchanged for other subscribers, e.g. 'pigh[]' "
+                         "(VLA client p/i/[/], streamer g/h) in the DAgger stack")
     return ap.parse_args()
 
 
 def message_for(key: str, args) -> str | None:
     """Wire message for one key (single-key mode), None if the key does nothing."""
     if key in VALID_KEYS:
+        return key
+    if key and key in getattr(args, "passthrough_keys", ""):
         return key
     if key.isdigit() and key != "0":
         return prompt_message(cell_prompt(int(key) - 1, args.prompt_template))
@@ -91,6 +102,9 @@ def main():
     print(cell_table(args.prompt_template))
     if args.base_prompt:
         print(f'  0 = {args.base_prompt}')
+    if args.passthrough_keys:
+        print(f"{TAG} forwarded unchanged: {' '.join(args.passthrough_keys)}  "
+              "(VLA client: p=run/pause i=init pose [ ]=init hands | streamer: g=POLICY mode h=intervention)")
     if args.line_mode:
         print(f"{TAG} line mode: also `t <text>` (Enter after each command)")
 
@@ -99,7 +113,7 @@ def main():
         print(f"{TAG} -> '{msg}'")
 
     def on_press(key):
-        if key in IGNORED_KEYS:
+        if key in IGNORED_KEYS and key not in args.passthrough_keys:
             print(f"{TAG} '{key}' ignored: this exporter has no ratings")
             return
         msg = message_for(key, args)
