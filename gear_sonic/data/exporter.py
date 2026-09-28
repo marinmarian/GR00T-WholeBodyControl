@@ -14,7 +14,6 @@ from typing import Any, Optional
 import datasets
 from datasets import load_dataset
 from datasets.utils import disable_progress_bars
-from huggingface_hub.errors import RepositoryNotFoundError
 from lerobot.common.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
@@ -154,6 +153,16 @@ class Gr00tDataExporter(LeRobotDataset):
        - Creates new video writer and ep buffer for the next episode
     """
 
+    # meta/ files a dataset must have before it can be resumed (checked locally so the
+    # LeRobot loader never falls back to the Hub for the placeholder repo_id).
+    RESUME_META_FILES = (
+        "info.json",
+        "modality.json",
+        "tasks.jsonl",
+        "episodes.jsonl",
+        "episodes_stats.jsonl",
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.video_writers = self.create_video_writer()
@@ -201,13 +210,38 @@ class Gr00tDataExporter(LeRobotDataset):
             )
             shutil.rmtree(save_root)
 
-        if (Path(save_root)).exists():
+        if Path(save_root).exists() and cls.is_episode_less_stub(save_root):
+            # Left behind by a session that initialised the exporter and was torn down
+            # before its first save_episode(): meta/info.json + meta/modality.json and
+            # empty video dirs, but no episodes. Resuming it would send the LeRobot
+            # loader to the Hub for "tmp/tmp_dataset" and fail as "corrupted"
+            # (g1-vr-teleop #59). There is nothing to keep, so start fresh in its place.
+            print(
+                f"Found dataset stub at {save_root} (no recorded episodes). "
+                "Removing it and starting a fresh dataset."
+            )
+            try:
+                shutil.rmtree(save_root)
+            except OSError as e:
+                raise ValueError(
+                    f"Could not remove episode-less dataset stub at {save_root} ({e}). "
+                    "Move it aside manually or pick another --dataset-name."
+                ) from e
+
+        if Path(save_root).exists():
+            missing = cls.missing_resume_files(save_root)
+            if missing:
+                # Do not let the loader fall back to the Hub for a local-only dataset.
+                raise ValueError(
+                    f"Failed to resume from corrupted dataset at {save_root}: "
+                    f"missing {', '.join(missing)}. Please manually check the dataset."
+                )
             try:
                 obj.meta = Gr00tDatasetMetadata(
                     repo_id=repo_id,
                     root=save_root,
                 )
-            except RepositoryNotFoundError as e:
+            except Exception as e:
                 raise ValueError(
                     f"Failed to resume from corrupted dataset. "
                     f"Please manually check the dataset at {save_root}"
@@ -243,6 +277,40 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.episode_data_index = None
         obj.video_writers = obj.create_video_writer()
         return obj
+
+    @staticmethod
+    def is_episode_less_stub(save_root: str | Path) -> bool:
+        """True if ``save_root`` is a dataset directory with no recorded episode.
+
+        Requires all of: no (non-empty) ``meta/episodes.jsonl``, ``meta/info.json``
+        absent/unreadable or ``total_episodes == 0``, and no parquet file under ``data/``.
+        Anything else is either a resumable dataset or real corruption, and is left alone.
+        """
+        root = Path(save_root)
+        episodes_file = root / "meta" / "episodes.jsonl"
+        if episodes_file.is_file() and episodes_file.stat().st_size > 0:
+            return False
+        info_file = root / "meta" / "info.json"
+        if info_file.is_file():
+            try:
+                with open(info_file) as f:
+                    if json.load(f).get("total_episodes", 0) > 0:
+                        return False
+            except (OSError, ValueError):
+                return False
+        if any((root / "data").rglob("*.parquet")):
+            return False
+        return True
+
+    @classmethod
+    def missing_resume_files(cls, save_root: str | Path) -> list[str]:
+        """Names of the ``meta/`` files a resumable dataset must have and this one lacks."""
+        meta = Path(save_root) / "meta"
+        return [
+            f"meta/{name}"
+            for name in cls.RESUME_META_FILES
+            if not (meta / name).is_file()
+        ]
 
     def create_video_writer(self) -> dict[str, VideoWriter]:
         video_writers = {}
