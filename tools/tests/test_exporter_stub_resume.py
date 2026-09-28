@@ -120,6 +120,25 @@ try:
     exp = create(root)
     assert exp.meta.total_episodes == 0
 
+    # 7. a non-empty directory without meta/info.json is NOT a stub and is never deleted
+    #    (think save_root pointing at outputs/ itself, or at an unrelated folder)
+    shutil.rmtree(root)
+    (root / "restocking" / "meta").mkdir(parents=True)
+    (root / "restocking" / "meta" / "info.json").write_text("{}")
+    assert not Gr00tDataExporter.is_episode_less_stub(root)
+    expect_corrupted(root, "meta/info.json")
+    assert (root / "restocking" / "meta" / "info.json").is_file(), "unrelated content must survive"
+
+    # 8. info.json present but unreadable or without total_episodes: not a stub either
+    shutil.rmtree(root)
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text("not json")
+    assert not Gr00tDataExporter.is_episode_less_stub(root)
+    (root / "meta" / "info.json").write_text("{}")
+    assert not Gr00tDataExporter.is_episode_less_stub(root)
+    expect_corrupted(root, "meta/tasks.jsonl")
+    assert (root / "meta" / "info.json").is_file()
+
     print("test_exporter_stub_resume: OK")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)

@@ -282,22 +282,29 @@ class Gr00tDataExporter(LeRobotDataset):
     def is_episode_less_stub(save_root: str | Path) -> bool:
         """True if ``save_root`` is a dataset directory with no recorded episode.
 
-        Requires all of: no (non-empty) ``meta/episodes.jsonl``, ``meta/info.json``
-        absent/unreadable or ``total_episodes == 0``, and no parquet file under ``data/``.
-        Anything else is either a resumable dataset or real corruption, and is left alone.
+        Positive identification only, since the caller deletes what this accepts: the
+        directory is completely empty, or ``meta/info.json`` parses and says
+        ``total_episodes == 0`` while there is no non-empty ``meta/episodes.jsonl`` and
+        no parquet file under ``data/``. A directory without a readable ``info.json``
+        (e.g. ``outputs/`` itself through a bad --dataset-name, or an unrelated folder)
+        is never a stub; it falls through to the resume checks and is left untouched.
         """
         root = Path(save_root)
+        if not any(root.iterdir()):
+            return True
+        info_file = root / "meta" / "info.json"
+        if not info_file.is_file():
+            return False
+        try:
+            with open(info_file) as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(info, dict) or info.get("total_episodes") != 0:
+            return False
         episodes_file = root / "meta" / "episodes.jsonl"
         if episodes_file.is_file() and episodes_file.stat().st_size > 0:
             return False
-        info_file = root / "meta" / "info.json"
-        if info_file.is_file():
-            try:
-                with open(info_file) as f:
-                    if json.load(f).get("total_episodes", 0) > 0:
-                        return False
-            except (OSError, ValueError):
-                return False
         if any((root / "data").rglob("*.parquet")):
             return False
         return True
