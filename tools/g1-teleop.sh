@@ -16,7 +16,7 @@
 # Manual steps that stay manual:
 #   * PICO app: PC service = 10.42.0.1 (hotspot) or 192.168.123.222 (wired) + Remote Vision -> 192.168.123.164
 #   * keys in run window: ]  = balance,  l = teleop on,  o = off   (L2+B = damp)
-#   * IGMP querier needs sudo: run it yourself if this script can't (it will tell you).
+#   * IGMP querier is a systemd unit (rig/igmp-querier.service, #18); this script only checks it.
 
 S=g1
 CONTROL_CMD='~/wbc-exec.sh python decoupled_wbc/control/main/teleop/run_g1_control_loop.py --interface real --no-with-hands --tracked_hands right'
@@ -35,16 +35,14 @@ XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service alread
 case "${1:-up}" in
 # ─────────────────────────────────────────────────────────────────────────────
 up)
-  # 0. IGMP querier (sudo). Try cached credentials; otherwise tell the user.
-  if pgrep -f igmp_querier.py >/dev/null; then
-    echo "[ok] igmp querier running"
-  elif sudo -n true 2>/dev/null; then
-    sudo nohup python3 ~/igmp_querier.py >/tmp/igmp.log 2>&1 &
-    echo "[ok] igmp querier started"
+  # 0. IGMP querier — systemd unit from boot (rig/igmp-querier.service, #18).
+  if systemctl is-active --quiet igmp-querier; then
+    echo "[ok] igmp querier running (systemd)"
   else
     echo "############################################################"
-    echo "# IGMP QUERIER NOT RUNNING (needs sudo).  In any terminal: #"
-    echo "#     sudo python3 ~/igmp_querier.py &                     #"
+    echo "# IGMP QUERIER NOT RUNNING.  In any terminal:              #"
+    echo "#     sudo systemctl restart igmp-querier                  #"
+    echo "#   (not installed? sudo rig/install_igmp_querier.sh)      #"
     echo "# Without it the DDS link dies ~4 min after connecting.    #"
     echo "############################################################"
   fi
@@ -103,13 +101,13 @@ down)
   pkill -f RoboticsServiceProcess 2>/dev/null
   ssh -o BatchMode=yes g1 'pkill -9 -f OrinVideoSenderI[R]' 2>/dev/null
   echo "[ok] stopped session, loops, bridge, xr-service, head-cam."
-  echo "     still running: wbc-dev container, igmp querier (sudo pkill -f igmp_querier.py)"
+  echo "     still running: wbc-dev container, igmp querier (systemd: sudo systemctl stop igmp-querier)"
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
 status)
   echo -n "tmux session:   "; tmux has-session -t $S 2>/dev/null && echo UP || echo down
   echo -n "wbc-dev:        "; docker ps --format '{{.Status}}' -f name=wbc-dev | grep -q . && echo UP || echo down
-  echo -n "igmp querier:   "; pgrep -f igmp_querier.py >/dev/null && echo UP || echo DOWN
+  echo -n "igmp querier:   "; systemctl is-active --quiet igmp-querier && echo UP || echo "DOWN (sudo systemctl restart igmp-querier)"
   echo -n "xr-service:     "; pgrep -f RoboticsServiceProcess >/dev/null && echo UP || echo down
   echo -n "pico bridge:    "; pgrep -f pico_vive_bridge.py >/dev/null && echo UP || echo down
   echo -n "control loop:   "; docker exec wbc-dev pgrep -f run_g1_control_loop >/dev/null 2>&1 && echo UP || echo down

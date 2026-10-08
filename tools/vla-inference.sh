@@ -16,7 +16,8 @@
 #                  exporter records every attempt as a LeRobot episode, the VLA client runs in --relay mode
 #                  behind the streamer, and the streamer's Inspire bridge drives the hands (no inspire_vla_bridge).
 #                  Extra env: DATASET (outputs/<name>, default policy_<date>), DATASET_BUCKET (S3, default
-#                  darwin-robot-data), INSPIRE_HANDS=trigger|handtracking|off. Needs the hotspot + PICO like teleop.
+#                  darwin-robot-data), INSPIRE_HANDS=trigger|handtracking|off. Needs the PICO on mjolnir's network (HP2 or the
+#                  mjolnir-xr hotspot) like teleop — RUNBOOK "Network".
 #
 # Layout:  window "svc": serve (local policy server) or tunnel | cam-g1 (head IR push) | cam-sender (OBSBOT + head, --autostart, ZMQ 5555)
 #          window "run": deploy (C++ SONIC, container) | inference (run_vla_inference) | hands (Inspire) | keys
@@ -59,7 +60,7 @@ CAMG1_CMD="ssh -tt g1 '$(headcam_push_cmd "$CAM_G1_GLOB" "$GST_G1_TAIL")'"
 CAMSEND_CMD='cd ~/XRoboToolkit-Orin-Video-Sender && ./OrinVideoSenderIR --listen 0.0.0.0:13579 --device '$CAM_COLOR' --pixfmt MJPG --width 1280 --height 720 --fps 30 --second-device udp:5600 --second-width 640 --second-height 480 --zmq-pub 5555 --autostart'
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
 # Identical to teleop: run_vla_inference.py replaces the PICO streamer as the zmq_manager source (5556 in, 5557 out).
-DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
+DEPLOY_RUN='./target/release/g1_deploy_onnx_ref mgbe0_0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
 # run_vla_inference.py queries the server's video keys ONCE at start-up and falls back to ego_view only if the
 # server is down -> never start it before the server listens (a local server needs 1-2 min to load 12 GB).
 WAIT_SERVER="until ss -ltn | grep -q ':$POLICY_PORT '; do echo 'waiting for policy server on :$POLICY_PORT ...'; sleep 3; done"
@@ -97,16 +98,21 @@ up)
     [ -x "$THOR_RIG/serve_policy.sh" ] || { echo "[!!] $THOR_RIG/serve_policy.sh missing — clone prosus-robotics/g1-vr-teleop or use POLICY_MODE=ec2"; exit 1; }
     [ -d "$HOME/checkpoints/restocking_$POLICY_MODEL/checkpoint-10000" ] || { echo "[!!] no local checkpoint ~/checkpoints/restocking_$POLICY_MODEL — see rig/thor/README.md"; exit 1; }
   fi
-  if pgrep -f igmp_querier.py >/dev/null; then echo "[ok] igmp querier running"
-  elif sudo -n true 2>/dev/null; then sudo nohup python3 ~/igmp_querier.py >/tmp/igmp.log 2>&1 & echo "[ok] igmp querier started"
-  else echo "[!!] IGMP QUERIER DOWN (needs sudo):  sudo nohup python3 ~/igmp_querier.py >/tmp/igmp.log 2>&1 &"; fi
+  # igmp querier — systemd unit from boot (rig/igmp-querier.service, #18); without it DDS dies ~4 min after the deploy subscribes
+  if systemctl is-active --quiet igmp-querier; then echo "[ok] igmp querier running (systemd)"
+  else echo "[!!] IGMP QUERIER DOWN:  sudo systemctl restart igmp-querier   (not installed? sudo rig/install_igmp_querier.sh)"; fi
   ping -c1 -W1 192.168.123.161 >/dev/null 2>&1 && echo "[ok] robot lowlevel up" || echo "[!!] robot lowlevel NOT reachable — power it on"
   ping -c1 -W1 192.168.123.164 >/dev/null 2>&1 && echo "[ok] robot PC (g1) up" || echo "[!!] robot PC (g1) not reachable — head camera push will wait"
   for ip in 192.168.123.210 192.168.123.211; do ping -c1 -W1 $ip >/dev/null 2>&1 && echo "[ok] inspire hand $ip up" || echo "[!!] inspire hand $ip not reachable"; done
   if [ "$DAGGER" = "1" ]; then
-    if ip -brief addr show wlP1p1s0 2>/dev/null | grep -q UP; then echo "[ok] hotspot up (PICO)"
-    elif sudo -n true 2>/dev/null; then sudo nmcli con up quest-hotspot >/dev/null 2>&1 && echo "[ok] hotspot started" || echo "[!!] hotspot failed to start"
-    else echo "[!!] HOTSPOT DOWN (needs sudo):  sudo nmcli con up quest-hotspot"; fi
+    # PICO network: HP2 router (mode A) or mjolnir-xr hotspot (mode B) — same detection as sonic-teleop.sh net_detect
+    if nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep -q '^quest-hotspot:' && ip -4 addr show wlP1p1s0 2>/dev/null | grep -q 'inet 10\.42\.0\.1/'; then
+      echo "[ok] hotspot mjolnir-xr up: mjolnir is 10.42.0.1 (PICO: PC service -> 10.42.0.1)"
+    else
+      HP2_IP=$(ip -4 route get 192.168.123.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+      if [ -n "$HP2_IP" ] && [ "$HP2_IP" != 192.168.123.222 ]; then echo "[ok] HP2 LAN up: mjolnir is $HP2_IP (PICO: PC service -> $HP2_IP)"
+      else echo "[!!] no PICO network:  sudo nmcli con up HP2  (router)  |  sudo nmcli con up quest-hotspot  (standalone)"; fi
+    fi
   fi
   tmux kill-session -t $S 2>/dev/null
   pkill -f "pico_manage[r]_thread" 2>/dev/null          # the teleop streamer also binds 5556 — must be down (DAGGER starts its own)

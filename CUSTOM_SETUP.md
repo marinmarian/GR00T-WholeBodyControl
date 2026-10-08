@@ -12,20 +12,36 @@ is specific to our machine **mjolnir** (Jetson AGX Thor backpack) driving a Unit
 
 ## 1. Hardware & network
 
-- **mjolnir** — Jetson AGX Thor, the compute driving the G1. Wired to the robot via a
-  **TP‑Link TL‑SG1005P switch** on one flat `192.168.123.0/24` LAN (mjolnir `enP2p1s0` =
+- **mjolnir** — Jetson AGX Thor, the compute driving the G1. Since 2026‑09‑24 the Thor
+  module sits on a **G601 carrier board** (same SSD, same OS). Wired to the robot via a
+  **TP‑Link TL‑SG1005P switch** on one flat `192.168.123.0/24` LAN (mjolnir `mgbe0_0` =
   `192.168.123.222`). G1 low‑level `.161`, G1 PC `.164`, Inspire hands `.210`/`.211`.
+  - The wired NIC name depends on the carrier: the G601 exposes the Thor's integrated MGBE
+    port as `mgbe0_0`; the previous carrier's Realtek PCIe card was `enP2p1s0`. The static
+    `.222` lives in the NetworkManager profile `robot`, bound by interface name, so a carrier
+    swap leaves it inactive and NM brings the port up on DHCP instead (`Wired connection N`).
+    After a swap: `sudo nmcli con mod robot connection.interface-name <nic>`, disable
+    autoconnect on the DHCP profile, `sudo nmcli con up robot`, then grep the repo for the
+    old name — the deploy takes the NIC as its first argument (#56).
 - **IGMP querier (required):** the unmanaged switch does IGMP snooping and there is no
   querier on the LAN, so it prunes the G1's DDS multicast (`rt/lowstate`, `rt/secondary_imu`)
   ~4 min after the deploy subscribes → the deploy dies with *"LowState or IMUState is not
-  available"*. Fix: run `~/igmp_querier.py` on mjolnir (raw‑socket IGMPv2 general query to
-  `224.0.0.1` every 60 s) for the whole session:
+  available"*. Fix: `rig/igmp_querier.py` (raw‑socket IGMPv2 general query to `224.0.0.1`
+  every 60 s) runs on mjolnir as the systemd unit `igmp-querier` from boot, restarting
+  itself (`rig/igmp-querier.service`, #18). Install / refresh with
   ```bash
-  sudo python3 ~/igmp_querier.py &
+  sudo rig/install_igmp_querier.sh      # then: systemctl status igmp-querier
   ```
-- **Headset Wi‑Fi:** mjolnir's built‑in Wi‑Fi runs as a dedicated 5 GHz hotspot
+  Exactly one querier must run: do not start the script by hand next to the unit.
+- **Headset Wi‑Fi — two modes (RUNBOOK "Network" is the current reference):** since 2026‑10‑06 the
+  default is **mode A**: PICO, laptop and mjolnir's wifi (`192.168.123.250`, NM profile `HP2`) all on
+  the GL.iNet travel router **HP2**, same `192.168.123.0/24` as the robot cable (so the `robot` profile
+  only routes `.160/29` + `.208/29` on‑link). **Mode B** is the original standalone setup below:
+  mjolnir's built‑in Wi‑Fi runs as a dedicated 5 GHz hotspot
   **`mjolnir-xr`** (NM connection `quest-hotspot`, AP `10.42.0.1`) so the headset gets a
-  low‑latency single hop (~1.6 ms vs 65–175 ms through the room router). Bring up with
+  low‑latency single hop (~1.6 ms vs 65–175 ms through the room router); the laptop joins it too
+  (`ssh marin@10.42.0.1`, no internet, no Tailscale). One radio, one mode at a time:
+  `~/sonic-teleop.sh net hp2|hotspot`. Bring the hotspot up by hand with
   `nmcli con up quest-hotspot`. Docker sets the FORWARD policy to DROP, which breaks NM's
   shared‑mode NAT, so for headset **internet** re‑add:
   ```bash
@@ -36,7 +52,8 @@ is specific to our machine **mjolnir** (Jetson AGX Thor backpack) driving a Unit
   **PICO / XRoboToolkit on the hotspot (recommended for latency):** the room router adds
   65–175 ms to the headset vs ~1.6 ms on the hotspot — noticeable in both tracking and the
   Remote Vision camera stream. Setup (redo after any mjolnir reboot, AFTER docker is up
-  since Docker resets the FORWARD policy to DROP):
+  since Docker resets the FORWARD policy to DROP; the FORWARD rules and the g1 route were only needed
+  while the video came from g1 — since 2026‑08 the sender runs on mjolnir, so `nmcli con up quest-hotspot` alone is enough):
   ```bash
   sudo nmcli con up quest-hotspot
   sudo iptables -I FORWARD 1 -i wlP1p1s0 -j ACCEPT
@@ -165,9 +182,9 @@ from the **PICO** natively — that's the device to use for precise manipulation
 ## 6. Run sheets
 
 ### SONIC whole‑body teleop with PICO (the "worked well" path)
-Prereqs up: IGMP querier, hotspot, XRoboToolkit service, robot on+damp.
+Prereqs up: IGMP querier (systemd, always on), hotspot, XRoboToolkit service, robot on+damp.
 1. **Deploy** (in `g1-deploy-dev` via `gear_sonic_deploy/docker/run-ros2-dev.sh`):
-   `./target/release/g1_deploy_onnx_ref enP2p1s0 policy/release/model_decoder.onnx reference/example/ --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost` → `Init Done`.
+   `./target/release/g1_deploy_onnx_ref mgbe0_0 policy/release/model_decoder.onnx reference/example/ --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost` → `Init Done`.
 2. **Streamer:** `.venv_teleop` → `python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source xrt --inspire-hands trigger`.
 3. **PICO:** connect (§4), confirm live body data.
 4. **Robot:** calibration pose → `A+B+X+Y` (stand) → `A+X` = whole‑body POSE, or
@@ -243,8 +260,8 @@ also drives the Inspire hand(s) of the tracked side (right trigger -> fingers, g
 `up` starts everything in a tmux session `g1` with ordering waits built in (xr-service ->
 bridge; control loop -> teleop loop), `down` stops it, `status` health-checks. Windows:
 `svc` = xr-service / head-cam / bridge, `run` = control + teleop loops (activation keys
-`]` `l` `o` go in the left pane). The IGMP querier stays manual (`sudo python3
-~/igmp_querier.py`, foreground) and the PICO app steps stay manual (PC service = mjolnir IP,
+`]` `l` `o` go in the left pane). The IGMP querier is the `igmp-querier` systemd unit (§1,
+checked by the script) and the PICO app steps stay manual (PC service = mjolnir IP,
 Remote Vision = the sender host's IP — mjolnir since 2026-08, see `RUNBOOK.md`).
 
 Known trip: a fast right-arm motion (or the engage snap) can exceed the 8 rad/s arm

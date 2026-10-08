@@ -4,6 +4,7 @@
 #   ~/sonic-teleop.sh up       start everything (then: tmux attach -t sonic)
 #   ~/sonic-teleop.sh down     stop everything (DAMP THE ROBOT FIRST: O / L2+B)
 #   ~/sonic-teleop.sh status   show what's running
+#   ~/sonic-teleop.sh net hp2|hotspot   switch the PICO/laptop network (sudo nmcli; see RUNBOOK "Network")
 #
 # tmux session "sonic", two windows:
 #   svc : [xr-service] [cam-g1: head-IR RTP push] [cam-thor: OBSBOT + composite sender]
@@ -11,12 +12,13 @@
 #
 # Policy: sonic_v1_1. Cameras: OBSBOT Tiny 2 Lite color (thor USB, left half;
 # MJPEG 1280x720@30 -> software jpegdec -> HW H.264) + D430i IR (g1, right half
-# via RTP/UDP:5600). Remote Vision IP for the PICO = 10.42.0.1.
+# via RTP/UDP:5600). Remote Vision IP for the PICO = mjolnir's address on the PICO's wifi (printed by `up`):
+# 192.168.123.250 on the HP2 router (mode A, default) or 10.42.0.1 on the mjolnir-xr hotspot (mode B, standalone).
 # OBSBOT: keep its AI tracking OFF (gimbal must not hunt during teleop); reset
 # pan/tilt/zoom with:  v4l2-ctl -d $CAM_COLOR -c pan_absolute=0,tilt_absolute=0,zoom_absolute=0
 #
 # Manual steps that stay manual:
-#   * PICO app: PC service 10.42.0.1 (WORKING); Head+Controller+Full body+Send;
+#   * PICO app: on wifi HP2 or mjolnir-xr, PC service = the address `up` prints (WORKING); Head+Controller+Full body+Send;
 #     ankle trackers calibrated. Streamer must STOP saying "waiting for body data".
 #   * Robot: on + damped (L2+B), hoisted, floor clear (POSE mode moves legs).
 #   * Activate: calibration pose -> one brief A+B+X+Y -> ~10 s -> stand -> A+X = POSE.
@@ -28,10 +30,29 @@ CAM_G1=/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_430i_Intel_R__Real
 # INSPIRE_HANDS=trigger (default: controller trigger/grip) | handtracking (PICO hand tracking, #35, experimental:
 # fingers -> trigger, thumb -> grip; buttons/sticks/e-stop stay on the controllers, keep them within reach) | off
 INSPIRE_HANDS="${INSPIRE_HANDS:-trigger}"
+
+# Network mode of the PICO/laptop side (RUNBOOK "Network"). The robot cable on mgbe0_0 (.222) is the same in both.
+#   hp2     : PICO + laptop + mjolnir on the GL.iNet router "HP2" (192.168.123.1); mjolnir over its own wifi (profile
+#             HP2, 192.168.123.250) or, cabled on purpose, mgbe1_0 ("Wired connection 2", DHCP). Shares the
+#             192.168.123.0/24 prefix with the robot cable, so the `robot` profile only carries on-link routes for
+#             .160/29 (robot) + .208/29 (Inspire hands) at metric 1000 and the rest of the /24 goes out the HP2 side.
+#   hotspot : everyone on mjolnir's own AP "mjolnir-xr" (profile quest-hotspot, 10.42.0.1, no router, no internet).
+# Sets NET_MODE (hp2|hotspot|none), NET_IP (what the PICO enters), NET_SSID.
+net_detect() {
+  NET_MODE=none; NET_IP=""; NET_SSID=""
+  if nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep -q '^quest-hotspot:' \
+     && ip -4 addr show wlP1p1s0 2>/dev/null | grep -q 'inet 10\.42\.0\.1/'; then
+    NET_MODE=hotspot; NET_IP=10.42.0.1; NET_SSID=mjolnir-xr
+  else
+    HP2_IP=$(ip -4 route get 192.168.123.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+    if [ -n "$HP2_IP" ] && [ "$HP2_IP" != 192.168.123.222 ]; then NET_MODE=hp2; NET_IP=$HP2_IP; NET_SSID=HP2; fi
+  fi
+}
+NET_HELP='sudo nmcli con up HP2  (router, mode A)   |   sudo nmcli con up quest-hotspot  (standalone mjolnir-xr, mode B)'
 # Streamer output is also written to logs/streamer-last-run.log (unbuffered) so a run can be diagnosed after `down`.
 STREAMER_CMD="cd ~/GR00T-WholeBodyControl && source .venv_teleop/bin/activate && mkdir -p logs && ${HAND_TRACKING_DEBUG:+HAND_TRACKING_DEBUG=1 }python -u gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source xrt --inspire-hands $INSPIRE_HANDS 2>&1 | tee logs/streamer-last-run.log"
 DEPLOY_ENTER='cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh'
-DEPLOY_RUN='./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
+DEPLOY_RUN='./target/release/g1_deploy_onnx_ref mgbe0_0 policy/sonic_v1_1/model_decoder.onnx reference/example/ --obs-config policy/sonic_v1_1/observation_config.yaml --encoder-file policy/sonic_v1_1/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost'
 # Head IR is pushed from g1 to mjolnir over RTP (5600 = composite's right half,
 # 5601 = the dataset head_view recorder); the OBSBOT + composite sender run here.
 CAMG1_CMD='ssh g1 "gst-launch-1.0 v4l2src device='$CAM_G1' ! video/x-raw,format=GRAY8,width=640,height=480,framerate=15/1 ! videoconvert ! video/x-raw,format=I420 ! jpegenc quality=80 ! rtpjpegpay ! multiudpsink clients=192.168.123.222:5600,192.168.123.222:5601"'
@@ -75,23 +96,30 @@ XRSVC_CMD='pgrep -f RoboticsServiceProcess >/dev/null && echo "xr-service alread
 case "${1:-up}" in
 # ─────────────────────────────────────────────────────────────────────────────
 up)
-  # 0. hotspot (sudo)
-  if ip -brief addr show wlP1p1s0 2>/dev/null | grep -q UP; then
-    echo "[ok] hotspot up"
-  elif sudo -n true 2>/dev/null; then
-    sudo nmcli con up quest-hotspot >/dev/null 2>&1 && echo "[ok] hotspot started" || echo "[!!] hotspot failed to start"
-  else
-    echo "[!!] HOTSPOT DOWN (needs sudo):  sudo nmcli con up quest-hotspot"
+  # 0. PICO/laptop network: mode A (HP2 router) or mode B (mjolnir-xr hotspot) — see net_detect above.
+  net_detect
+  case $NET_MODE in
+    hotspot)
+      N_STA=$(iw dev wlP1p1s0 station dump 2>/dev/null | grep -c '^Station')
+      echo "[ok] hotspot mjolnir-xr up: mjolnir is $NET_IP, $N_STA device(s) joined  (PICO + laptop join mjolnir-xr; PC service + Remote Vision -> $NET_IP)" ;;
+    hp2)
+      if ping -c1 -W1 192.168.123.1 >/dev/null 2>&1; then
+        echo "[ok] HP2 LAN up: mjolnir is $NET_IP  (PICO + laptop on wifi HP2; PC service + Remote Vision -> $NET_IP)"
+      else
+        echo "[!!] HP2 router 192.168.123.1 not answering from $NET_IP — check HP2 wifi (sudo nmcli con up HP2) or go standalone (sudo nmcli con up quest-hotspot)"
+      fi ;;
+    *)
+      echo "[!!] no PICO network (HP2 not routed, hotspot down; replies to the PICO would leave on the robot cable):  $NET_HELP" ;;
+  esac
+  if [ "$INSPIRE_HANDS" != off ] && ! ip -4 route get 192.168.123.210 2>/dev/null | grep -q 'dev mgbe0_0'; then
+    echo "[!!] Inspire hands .210/.211 are NOT routed to the robot cable:  sudo nmcli con mod robot +ipv4.routes 192.168.123.208/29 && sudo nmcli con up robot"
   fi
 
-  # 1. igmp querier (sudo) — without it DDS dies ~4 min after the deploy subscribes
-  if pgrep -f igmp_querier.py >/dev/null; then
-    echo "[ok] igmp querier running"
-  elif sudo -n true 2>/dev/null; then
-    sudo nohup python3 ~/igmp_querier.py >/tmp/igmp.log 2>&1 &
-    echo "[ok] igmp querier started"
+  # 1. igmp querier — systemd unit from boot (rig/igmp-querier.service, #18); without it DDS dies ~4 min after the deploy subscribes
+  if systemctl is-active --quiet igmp-querier; then
+    echo "[ok] igmp querier running (systemd)"
   else
-    echo "[!!] IGMP QUERIER DOWN (needs sudo):  sudo nohup python3 ~/igmp_querier.py >/tmp/igmp.log 2>&1 &"
+    echo "[!!] IGMP QUERIER DOWN:  sudo systemctl restart igmp-querier   (not installed? sudo rig/install_igmp_querier.sh)"
   fi
 
   # 2. robot reachable?
@@ -139,8 +167,8 @@ up)
   echo "Session '$S' up.  Attach:   tmux attach -t $S"
   echo "  run window: LEFT = streamer, RIGHT = deploy ('O' = e-stop). Wait for 'Init Done'."
   echo "  svc window (Ctrl-b n): xr-service / cam-g1 / cam-thor"
-  echo "  PICO: PC service 10.42.0.1 -> WORKING; Full body + Send + ankle trackers;"
-  echo "        Remote Vision -> 10.42.0.1 (color left, head-IR right)"
+  echo "  PICO (wifi ${NET_SSID:-HP2 or mjolnir-xr}): PC service ${NET_IP:-<mjolnir ip, network is down>} -> WORKING; Full body + Send + ankle trackers;"
+  echo "        Remote Vision -> ${NET_IP:-<same>} (color left, head-IR right)"
   echo "  DO NOT press A+B+X+Y while the streamer says 'waiting for body data'."
   echo "  Drive: calibration pose -> A+B+X+Y (stand) -> A+X (whole-body POSE)."
   echo "  Record (EXPORTER=${EXPORTER:-zmq}): $RECORD_HELP"
@@ -161,13 +189,16 @@ down)
   docker exec wbc-marin bash -c 'pkill -f "run_.*data_exporte[r]"; pkill -f "record_key[s]"' 2>/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=4 g1 'pkill -f "gst-launc[h]"' 2>/dev/null
   echo "[ok] stopped session, streamer, deploy, cameras, exporter."
-  echo "     left running: xr-service (may be shared), igmp querier, hotspot."
+  echo "     left running: xr-service (may be shared), igmp querier (systemd), the network (HP2 / hotspot)."
   ;;
 # ─────────────────────────────────────────────────────────────────────────────
 status)
   echo -n "tmux session:   "; tmux has-session -t $S 2>/dev/null && echo UP || echo down
-  echo -n "hotspot:        "; ip -brief addr show wlP1p1s0 2>/dev/null | grep -q UP && echo UP || echo DOWN
-  echo -n "igmp querier:   "; pgrep -f igmp_querier.py >/dev/null && echo UP || echo DOWN
+  echo -n "network:        "; net_detect; case $NET_MODE in
+    hotspot) echo "hotspot mjolnir-xr (mjolnir = $NET_IP, $(iw dev wlP1p1s0 station dump 2>/dev/null | grep -c '^Station') device(s) joined)" ;;
+    hp2) ping -c1 -W1 192.168.123.1 >/dev/null 2>&1 && echo "HP2 router (mjolnir = $NET_IP)" || echo "HP2 routed via $NET_IP but router 192.168.123.1 not answering" ;;
+    *) echo "DOWN ($NET_HELP)" ;; esac
+  echo -n "igmp querier:   "; systemctl is-active --quiet igmp-querier && echo UP || echo "DOWN (sudo systemctl restart igmp-querier)"
   echo -n "xr-service:     "; pgrep -f RoboticsServiceProcess >/dev/null && echo UP || echo down
   echo -n "streamer:       "; pgrep -f "pico_manage[r]_thread" >/dev/null && echo UP || echo down
   echo -n "deploy:         "; pgrep -f "g1_deploy_onnx_re[f]" >/dev/null && echo UP || echo down
@@ -176,8 +207,29 @@ status)
   echo -n "data exporter:  "; docker exec wbc-marin pgrep -f "run_.*data_exporter" >/dev/null 2>&1 && echo UP || echo down
   echo -n "record keys:    "; docker exec wbc-marin pgrep -f "record_key" >/dev/null 2>&1 && echo UP || echo down
   echo -n "robot lowlevel: "; ping -c1 -W1 192.168.123.161 >/dev/null 2>&1 && echo UP || echo DOWN
-  echo -n "PICO on hotspot:"; ip neigh show dev wlP1p1s0 2>/dev/null | grep -q REACHABLE && echo " yes" || echo " not seen"
+  echo -n "LAN neighbours: "; ip neigh show 2>/dev/null | grep -v 'dev mgbe0_0' | awk '/REACHABLE|STALE|DELAY/ && $1!="192.168.123.1"{print $1}' | sort -u | tr '\n' ' ' | grep . || echo "none seen (PICO/laptop not on ${NET_SSID:-the network} yet?)"
+  ;;
+# ─────────────────────────────────────────────────────────────────────────────
+net)
+  # Switch the PICO/laptop network (one wifi radio: activating one profile drops the other). Any ssh session riding on
+  # mjolnir's wifi (HP2 or Tailscale) drops with it — run this at the keyboard or expect to reconnect.
+  case "${2:-}" in
+    hp2)     PROF=HP2;           WHAT="mode A: PICO + laptop on the HP2 router" ;;
+    hotspot) PROF=quest-hotspot; WHAT="mode B: PICO + laptop join mjolnir-xr (standalone, no internet)" ;;
+    *) echo "usage: $0 net {hp2|hotspot}"; net_detect; echo "current: $NET_MODE ${NET_IP:+(mjolnir = $NET_IP)}"; exit 1 ;;
+  esac
+  net_detect
+  if [ "$NET_MODE" = "${2}" ]; then echo "[ok] already $WHAT (mjolnir = $NET_IP)"; exit 0; fi
+  echo "switching -> $WHAT   (sudo nmcli con up $PROF; ssh over wifi/Tailscale will drop)"
+  if sudo nmcli con up "$PROF"; then
+    sleep 2; net_detect
+    [ "$NET_MODE" = "${2}" ] && echo "[ok] $WHAT: mjolnir = $NET_IP  (PICO: PC service + Remote Vision -> $NET_IP)" \
+                              || echo "[!!] profile $PROF is up but the mode was not detected — check: ip -4 addr show wlP1p1s0; nmcli con show --active"
+  else
+    echo "[!!] nmcli con up $PROF failed. Hotspot wedged? sudo systemctl restart wpa_supplicant NetworkManager && sleep 5 && sudo nmcli con up $PROF  (RUNBOOK 'Hotspot gone')"
+    exit 1
+  fi
   ;;
 *)
-  echo "usage: $0 {up|down|status}"; exit 1 ;;
+  echo "usage: $0 {up|down|status|net hp2|net hotspot}"; exit 1 ;;
 esac

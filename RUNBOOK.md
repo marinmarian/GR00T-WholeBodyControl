@@ -2,8 +2,8 @@
 
 Operational guide for our rig as of 2026-08-25. Covers the one-command script,
 every component run separately, and recovery for everything that has ever
-broken. Machine names: **mjolnir** = Jetson Thor backpack (`192.168.123.222`,
-hotspot AP `10.42.0.1`), **g1** = robot's onboard Orin Nano
+broken. Machine names: **mjolnir** = Jetson Thor backpack (`192.168.123.222` on the robot cable;
+`192.168.123.250` on wifi HP2 or `10.42.0.1` as the `mjolnir-xr` hotspot, see **Network**), **g1** = robot's onboard Orin Nano
 (`192.168.123.164`, ssh alias `g1`), robot low-level = `192.168.123.161`.
 
 This fork is the working checkout on mjolnir. The team's canonical copy of this runbook and the project docs live in
@@ -16,8 +16,8 @@ two milestones — [Bartending demo, AI House (Aug 2026)](https://github.com/pro
 
 | piece | runs on | notes |
 |---|---|---|
-| hotspot `mjolnir-xr` | mjolnir wifi | AP `10.42.0.1`, pw `g1teleop2026` |
-| IGMP querier | mjolnir (sudo) | keeps robot DDS multicast alive |
+| router `HP2` (GL.iNet) **or** hotspot `mjolnir-xr` | PICO + laptop + mjolnir wifi | mode A: gateway `192.168.123.1`, mjolnir = `192.168.123.250`; mode B: mjolnir's own AP `10.42.0.1` (see **Network**) |
+| IGMP querier | mjolnir, systemd `igmp-querier` | keeps robot DDS multicast alive; runs from boot, restarts itself (#18) |
 | xr-service (`RoboticsServiceProcess`) | mjolnir | PICO tracking backend; **may be another user's — never kill** |
 | streamer (`pico_manager_thread_server`) | mjolnir `.venv_teleop` | PICO → SONIC; drives Inspire hands |
 | deploy (`g1_deploy_onnx_ref`) | mjolnir, `g1-deploy-dev` container | SONIC policy → robot; `O` = e-stop |
@@ -26,7 +26,51 @@ two milestones — [Bartending demo, AI House (Aug 2026)](https://github.com/pro
 | episode exporter + keys | mjolnir, `wbc-marin` container | LeRobot datasets + S3 upload |
 
 Cameras: **OBSBOT Tiny 2 Lite (color) on mjolnir USB** (replaced the D455f 2026-09-07), **D430i (head IR) on g1**.
-PICO enters exactly two addresses: **PC service `10.42.0.1`**, **Remote Vision `10.42.0.1`**.
+PICO enters exactly two addresses, **PC service** and **Remote Vision**, both = mjolnir's address on the PICO's wifi:
+`192.168.123.250` on HP2 (mode A), `10.42.0.1` on the hotspot (mode B) — `up` prints the current one.
+
+## Network (two modes, one at a time)
+
+The robot is always on the cable into `mgbe0_0` (`192.168.123.222`, profile `robot`). The PICO, the operator laptop
+and mjolnir's own wifi are either all on the GL.iNet travel router **HP2** (**mode A**, the default since 2026-10-06)
+or all on mjolnir's own hotspot **`mjolnir-xr`** (**mode B**, standalone: no router, no internet for anyone — this is
+the mode for running away from the lab). mjolnir has one wifi radio, so it is one mode at a time; `up` and `status`
+detect which one is active and print the address the PICO must enter.
+
+| mode | who is where | mjolnir profile | PICO enters |
+|---|---|---|---|
+| **A: HP2** (default; autoconnects at boot) | PICO + laptop + mjolnir on HP2 (gateway `192.168.123.1`, DHCP `.100`-`.249`) | `HP2` on `wlP1p1s0` (manual `192.168.123.250`, powersave off) — or, cabled on purpose, `Wired connection 2` on `mgbe1_0` (DHCP, autoconnect off) | `192.168.123.250` (or the `mgbe1_0` lease; `up` prints it) |
+| **B: hotspot** `mjolnir-xr` | PICO + laptop join mjolnir's AP (5 GHz ch 36; password: `sudo nmcli -s -g 802-11-wireless-security.psk con show quest-hotspot`), DHCP `10.42.0.x` from NM | `quest-hotspot` on `wlP1p1s0` (AP, shared `10.42.0.1`, autoconnect off) | `10.42.0.1` |
+| always: robot cable | g1 `.164`, low-level `.161`, Inspire hands `.210`/`.211` | `robot` on `mgbe0_0`: `192.168.123.222`, **on-link routes only `192.168.123.160/29` + `.208/29`, metric 1000, no default** | — |
+
+Switching. Any ssh session that rides on mjolnir's wifi (HP2 or Tailscale) drops when you switch — run it at the
+keyboard or expect to reconnect. HP2 comes back by itself at boot; the hotspot is only ever started by hand.
+```bash
+~/sonic-teleop.sh net hotspot    # = sudo nmcli con up quest-hotspot  -> PICO + laptop join mjolnir-xr; PC service + Remote Vision = 10.42.0.1
+~/sonic-teleop.sh net hp2        # = sudo nmcli con up HP2            -> back on the router;            PC service + Remote Vision = 192.168.123.250
+~/sonic-teleop.sh status | grep -E 'network|neigh'
+```
+
+**Mode A notes.** Both links share `192.168.123.0/24`, so the `robot` profile must stay narrowed to the robot hosts
+(`.161` low-level, `.164` g1 → `.160/29`; Inspire hands `.210`/`.211` → `.208/29`). With a plain `/24` on `mgbe0_0`
+at a lower metric, every reply to the PICO or the laptop leaves on the robot cable and dies — `up` detects that and
+refuses to say `[ok]`. The deploy still binds `mgbe0_0` by name; the IGMP querier is pinned to it with `IGMP_IFACE`.
+ssh to mjolnir as `ssh marin@192.168.123.250` — Tailscale has no DERP fallback on HP2 (no internet), so it drops
+whenever mjolnir's LAN path changes and takes a while to come back.
+```bash
+ip route | grep 192.168.123                              # .160/29 + .208/29 dev mgbe0_0 ; .0/24 dev wlP1p1s0 (or mgbe1_0 when cabled)
+ping -c2 192.168.123.161 && ping -c2 192.168.123.1       # robot over the cable, router over HP2
+ip route get 192.168.123.210 | grep -q mgbe0_0 || sudo nmcli con mod robot +ipv4.routes 192.168.123.208/29   # hands route missing (then: sudo nmcli con up robot)
+```
+Latency: 2026-10-08 `ping 192.168.123.1` from mjolnir over HP2 was 1.5 ms min / 64 ms avg / 234 ms max — spiky.
+The old room router gave the headset 65-175 ms vs ~1.6 ms on the hotspot (CUSTOM_SETUP.md). Measure `ping <PICO ip>`
+from mjolnir before a long session; if HP2 is bad, switch to mode B rather than fighting the router.
+
+**Mode B notes.** ssh to mjolnir as `ssh marin@10.42.0.1`. Nothing has internet and Tailscale does not work; reach g1
+through mjolnir (`ssh -J marin@10.42.0.1 g1`, or from mjolnir's shell). The camera sender listens on all interfaces and
+the deploy/querier stay on `mgbe0_0`, so nothing else changes. Do the one-time rtl8852ce power-save fix (Troubleshooting
+"Hotspot gone"), otherwise AP mode wedges after a while. Headset internet is optional (MASQUERADE rule under "Running
+every piece separately"); the 2026-07 route from g1 to `10.42.0.0/24` is no longer needed since the video comes from mjolnir.
 
 ---
 
@@ -34,7 +78,7 @@ PICO enters exactly two addresses: **PC service `10.42.0.1`**, **Remote Vision `
 
 ```bash
 ssh mjolnir
-sudo -v                    # cache sudo so the script can start hotspot+querier itself
+sudo -v                    # only needed if `up` has to repair the network (it prints the command)
 ~/sonic-teleop.sh up       # symlink -> ~/GR00T-WholeBodyControl/tools/sonic-teleop.sh (since 2026-09-21; it was a stale copy before)
 tmux attach -t sonic
 ```
@@ -47,10 +91,11 @@ tmux attach -t sonic
 - Dataset naming: `DATASET=stack_cups TASK="stack the cups" ~/sonic-teleop.sh up`
 
 ### PICO setup
-1. WiFi → `mjolnir-xr` (keep connection despite "no internet")
-2. App → PC service `10.42.0.1` → **WORKING**; tick **Head + Controller + Full body** and **Send**;
-   ankle trackers powered, paired, **calibrated**
-3. Remote Vision → `10.42.0.1` (color left, head-IR right)
+1. WiFi → **`HP2`** (mode A, same network as the laptop) or **`mjolnir-xr`** (mode B, keep the connection despite
+   "no internet") — whichever `up` reported (see **Network**)
+2. App → PC service `192.168.123.250` (HP2) / `10.42.0.1` (hotspot) → **WORKING**; tick **Head + Controller + Full body**
+   and **Send**; ankle trackers powered, paired, **calibrated**
+3. Remote Vision → the same address (color left, head-IR right)
 4. **Never activate while the streamer prints `waiting for body data`** — that message
    must stop first (it means trackers/Full body/Send aren't right yet).
 
@@ -145,21 +190,29 @@ on this stack — see the ROS 2 entry in Troubleshooting.
 
 ## Running every piece separately
 
-### Hotspot (mjolnir, sudo)
+### Network mode (mjolnir, sudo) — see **Network**
 ```bash
-sudo nmcli con up quest-hotspot
+~/sonic-teleop.sh net hp2        # mode A: sudo nmcli con up HP2            (default, autoconnects at boot)
+~/sonic-teleop.sh net hotspot    # mode B: sudo nmcli con up quest-hotspot  (standalone mjolnir-xr, no internet)
 ```
-Headset internet (optional, stops Android nagging):
+Headset internet on the hotspot (optional, stops Android nagging; only useful if mjolnir itself has an uplink):
 ```bash
 sudo iptables -t nat -A POSTROUTING -s 10.42.0.0/24 ! -d 10.42.0.0/24 -j MASQUERADE
 ```
 
-### IGMP querier (mjolnir, sudo) — REQUIRED before robot work
+### IGMP querier (mjolnir, systemd) — REQUIRED before robot work
+Runs from boot as the systemd unit `igmp-querier` (`rig/igmp-querier.service` → `rig/igmp_querier.py`, #18).
+It picks the interface that has an address on `192.168.123.0/24` itself, so a DHCP lease or NIC rename does
+not break it. Nothing to start by hand; the launchers only check it.
 ```bash
-sudo nohup python3 ~/igmp_querier.py >/tmp/igmp.log 2>&1 &
+systemctl is-active igmp-querier            # active
+journalctl -u igmp-querier -n 20            # "IGMP querier running on <iface>: general query ... every 60 s"
+sudo systemctl restart igmp-querier         # if it is down
+sudo rig/install_igmp_querier.sh            # first install / after editing the script or unit (also kills stray manual copies)
 ```
 Without it the switch prunes the robot's DDS multicast ~4 min after the deploy
-subscribes → deploy dies with `LowState or IMUState is not available`.
+subscribes → deploy dies with `LowState or IMUState is not available`. There must be
+exactly one querier: never start `igmp_querier.py` by hand next to the unit.
 
 ### xr-service (mjolnir)
 ```bash
@@ -178,7 +231,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source
 ```bash
 cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && ./docker/run-ros2-dev.sh
 # inside the container:
-./target/release/g1_deploy_onnx_ref enP2p1s0 policy/sonic_v1_1/model_decoder.onnx reference/example/ \
+./target/release/g1_deploy_onnx_ref mgbe0_0 policy/sonic_v1_1/model_decoder.onnx reference/example/ \
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --encoder-file policy/sonic_v1_1/model_encoder.onnx \
   --planner-file planner/target_vel/V2/planner_sonic.onnx \
@@ -284,24 +337,26 @@ sudo nmcli con up quest-hotspot
 # if that errors ("supplicant took too long", "not authorized"):
 sudo systemctl restart wpa_supplicant NetworkManager && sleep 5 && sudo nmcli con up quest-hotspot
 ```
-Permanent fix (do once):
+Permanent fix (do once, then reboot; still not applied as of 2026-10-08 — `cat /etc/modprobe.d/rtl8852ce-hotspot.conf`):
 ```bash
 echo "options rtl8852ce rtw_ips_mode=0 rtw_lps_mode=0" | sudo tee /etc/modprobe.d/rtl8852ce-hotspot.conf
-sudo nmcli con mod quest-hotspot connection.autoconnect yes connection.autoconnect-priority 10
 ```
-After any hotspot/NM restart the PICO must rejoin the WiFi and reconnect the app.
+After any hotspot/NM restart the PICO must rejoin the WiFi and reconnect the app. Making the hotspot a boot-time
+fallback (`connection.autoconnect yes`, `autoconnect-priority 10`, below HP2's 100) is untested: NM may bring the AP up
+before the HP2 scan has finished. Keep it manual (`net hotspot`) unless someone verifies that.
 
 **No camera feed in Remote Vision**
-1. Close the panel fully and reopen → `10.42.0.1` (the app single-accepts one
+1. Close the panel fully and reopen → mjolnir's address for the current mode (the app single-accepts one
    video connection per request and gives up silently; a fresh open re-arms it).
 2. Still nothing → restart the XRoboToolkit app completely, reconnect, retry.
 3. Check the sender pane: `Connection refused` retrying = the headset's
    listener isn't up (app state); the sender knocks for 60 s per request.
 4. **Never probe/connect to the headset's port 12345 while testing** — you will
    consume the app's only accept slot.
-5. The video MUST originate from the hotspot subnet AND from the exact IP typed
+5. The video MUST originate from the PICO's own subnet AND from the exact IP typed
    as camera source (the headset drops everything else). This is why the sender
-   lives on mjolnir and Remote Vision points at `10.42.0.1`. Do not relay or
+   lives on mjolnir and Remote Vision points at mjolnir's address on the PICO's wifi
+   (`192.168.123.250` on HP2, `10.42.0.1` on the hotspot). Do not relay or
    route the video from another host.
 6. Feeds connect but never render (2026 app versions): the client waits for an
    `OPEN_CAMERA_ACK` reply on the control connection before showing video, and
@@ -435,8 +490,9 @@ is the fallback (`POLICY_MODE=ec2`). Same SONIC deploy, cameras and Inspire hand
    Check with the training-vs-live picture: `~/Desktop/restocking_eval/live/cam_compare.sh` on the Mac
    (needs the sender running). The side camera must show the table the way the recordings do.
 3. **Teleop must be down** (`tools/sonic-teleop.sh down`): the PICO streamer and the VLA client both bind 5556.
-4. `sudo -v` on mjolnir so the launcher can start the IGMP querier. Without the querier the switch drops the
-   robot's DDS multicast ~4 min after the deploy subscribes and the deploy dies at `k` with
+4. IGMP querier: `systemctl is-active igmp-querier` must say `active` (systemd unit since #18, the launcher
+   checks it; `sudo rig/install_igmp_querier.sh` if it was never installed). Without the querier the switch drops
+   the robot's DDS multicast ~4 min after the deploy subscribes and the deploy dies at `k` with
    `LowState or IMUState is not available` (happened on the first run).
 5. Policy server: nothing to do in local mode — the launcher starts it (`POLICY_MODEL=best34` default, `v2` the other
    one) and the inference pane waits until it listens. First time on a freshly set-up mjolnir: `rig/thor/README.md`
@@ -509,8 +565,14 @@ E-stop: `O` in the deploy pane (or A+B+X+Y on the controllers if the streamer we
 - **`k` always STARTs, `x` STOPs.** The upstream `k` toggle relied on the client's own memory; after a deploy
   restart it sent STOP for START and the deploy quit (second run, 2026-09-11).
 - **Deploy died at `k` with `LowState or IMUState is not available` → `Planner initialization timeout`**: IGMP
-  querier down (see "Before you start"). Lowstate itself: `~/eval_vla/lowstate_check.py enP2p1s0` → ~1 kHz.
+  querier down (see "Before you start"): `systemctl status igmp-querier`, `journalctl -u igmp-querier -n 20`,
+  `sudo systemctl restart igmp-querier`. Lowstate itself: `~/GR00T-WholeBodyControl/.venv_teleop/bin/python ~/eval_vla/lowstate_check.py mgbe0_0` → ~1 kHz (needs the teleop venv for `unitree_sdk2py`).
   Restart the deploy from the container prompt with `./run_sonic.sh`.
+- **Deploy exits at start because it cannot find the interface / nothing reaches mjolnir at `.222`**: the wired NIC
+  name changed with the carrier board (2026‑09‑24: `enP2p1s0` → `mgbe0_0` on the G601) and the static NM profile
+  `robot` is still bound to the old name, so the port came up on DHCP. Check `ip -br addr` and
+  `nmcli con show robot`; fix with `sudo nmcli con mod robot connection.interface-name mgbe0_0 && sudo nmcli con up robot`
+  (CUSTOM_SETUP §1, #56).
 - **`Address already in use 5550`**: a previous server is still on the port; both `serve_policy.sh` (Thor and darwin-gpu)
   stop it first, `vla-inference.sh up` kills a stale local server, or `tmux kill-session -t policy` on darwin-gpu.
 - **Inference pane started before the server → `Policy video keys` missing / single `ego_view`.** `run_vla_inference.py`
