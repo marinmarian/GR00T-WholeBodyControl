@@ -1,0 +1,22 @@
+# Boot-time network fallback for mjolnir (RUNBOOK "Network"): if the HP2 router is not around, start the
+# mjolnir-xr hotspot so the PICO and the laptop can still join (mode B). Installed to /etc/systemd/system by
+# rig/install_hotspot_fallback.sh together with the script (/usr/local/bin/hotspot_fallback.sh). Runs once per boot.
+[Unit]
+Description=Hotspot fallback: start mjolnir-xr when HP2 is not reachable after boot
+Documentation=https://github.com/prosus-robotics/g1-vr-teleop/pull/66
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hotspot_fallback.sh
+# seconds to wait for HP2 before falling back, then extra grace if HP2's SSID is visible
+Environment=WAIT=45 GRACE=30
+TimeoutStartSec=180
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

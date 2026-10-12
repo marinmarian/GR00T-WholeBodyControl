@@ -199,6 +199,7 @@ status)
     hp2) ping -c1 -W1 192.168.123.1 >/dev/null 2>&1 && echo "HP2 router (mjolnir = $NET_IP)" || echo "HP2 routed via $NET_IP but router 192.168.123.1 not answering" ;;
     *) echo "DOWN ($NET_HELP)" ;; esac
   echo -n "igmp querier:   "; systemctl is-active --quiet igmp-querier && echo UP || echo "DOWN (sudo systemctl restart igmp-querier)"
+  echo -n "hotspot fallbk: "; case $(systemctl is-enabled hotspot-fallback 2>/dev/null) in enabled) echo "enabled at boot ($(systemctl show -p Result --value hotspot-fallback 2>/dev/null) this boot: $(journalctl -u hotspot-fallback -b -o cat -n1 2>/dev/null | cut -c18-90))" ;; *) echo "not installed (sudo rig/install_hotspot_fallback.sh) — no hotspot without HP2 unless 'net hotspot'" ;; esac
   echo -n "xr-service:     "; pgrep -f RoboticsServiceProcess >/dev/null && echo UP || echo down
   echo -n "streamer:       "; pgrep -f "pico_manage[r]_thread" >/dev/null && echo UP || echo down
   echo -n "deploy:         "; pgrep -f "g1_deploy_onnx_re[f]" >/dev/null && echo UP || echo down

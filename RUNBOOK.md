@@ -44,7 +44,13 @@ detect which one is active and print the address the PICO must enter.
 | always: robot cable | g1 `.164`, low-level `.161`, Inspire hands `.210`/`.211` | `robot` on `mgbe0_0`: `192.168.123.222`, **on-link routes only `192.168.123.160/29` + `.208/29`, metric 1000, no default** | — |
 
 Switching. Any ssh session that rides on mjolnir's wifi (HP2 or Tailscale) drops when you switch — run it at the
-keyboard or expect to reconnect. HP2 comes back by itself at boot; the hotspot is only ever started by hand.
+keyboard or expect to reconnect. At boot HP2 wins when it is in range; otherwise the systemd unit **`hotspot-fallback`**
+(`rig/hotspot-fallback.service` → `rig/hotspot_fallback.sh`, `sudo rig/install_hotspot_fallback.sh`) starts mjolnir-xr
+by itself: it waits 45 s for the wifi to be connected (or HP2 over the `mgbe1_0` cable), gives NM 30 s more if HP2's SSID
+is visible, then `nmcli con up quest-hotspot`. It never touches an already connected wifi, so in the lab it is a no-op;
+away from the lab mjolnir boots straight into mode B (`journalctl -u hotspot-fallback -b`). Do not set the
+`quest-hotspot` profile itself to autoconnect — an AP profile is "available" before the first scan returns, so it would
+win over HP2 at every boot.
 ```bash
 ~/sonic-teleop.sh net hotspot    # = sudo nmcli con up quest-hotspot  -> PICO + laptop join mjolnir-xr; PC service + Remote Vision = 10.42.0.1
 ~/sonic-teleop.sh net hp2        # = sudo nmcli con up HP2            -> back on the router;            PC service + Remote Vision = 192.168.123.250
@@ -67,7 +73,19 @@ The old room router gave the headset 65-175 ms vs ~1.6 ms on the hotspot (CUSTOM
 from mjolnir before a long session; if HP2 is bad, switch to mode B rather than fighting the router.
 
 **Mode B notes.** ssh to mjolnir as `ssh marin@10.42.0.1`. Nothing has internet and Tailscale does not work; reach g1
-through mjolnir (`ssh -J marin@10.42.0.1 g1`, or from mjolnir's shell). The camera sender listens on all interfaces and
+through mjolnir (`ssh -J marin@10.42.0.1 g1`, or from mjolnir's shell). On the laptop, once, so that
+`ssh mjolnir-xr` and `ssh g1-xr` just work:
+```bash
+cat >> ~/.ssh/config <<'EOF'
+Host mjolnir-xr
+    HostName 10.42.0.1
+    User marin
+Host g1-xr
+    HostName 192.168.123.164
+    User unitree
+    ProxyJump mjolnir-xr
+EOF
+``` The camera sender listens on all interfaces and
 the deploy/querier stay on `mgbe0_0`, so nothing else changes. Do the one-time rtl8852ce power-save fix (Troubleshooting
 "Hotspot gone"), otherwise AP mode wedges after a while. Headset internet is optional (MASQUERADE rule under "Running
 every piece separately"); the 2026-07 route from g1 to `10.42.0.0/24` is no longer needed since the video comes from mjolnir.
@@ -337,13 +355,13 @@ sudo nmcli con up quest-hotspot
 # if that errors ("supplicant took too long", "not authorized"):
 sudo systemctl restart wpa_supplicant NetworkManager && sleep 5 && sudo nmcli con up quest-hotspot
 ```
-Permanent fix (do once, then reboot; still not applied as of 2026-10-08 — `cat /etc/modprobe.d/rtl8852ce-hotspot.conf`):
-```bash
-echo "options rtl8852ce rtw_ips_mode=0 rtw_lps_mode=0" | sudo tee /etc/modprobe.d/rtl8852ce-hotspot.conf
-```
-After any hotspot/NM restart the PICO must rejoin the WiFi and reconnect the app. Making the hotspot a boot-time
-fallback (`connection.autoconnect yes`, `autoconnect-priority 10`, below HP2's 100) is untested: NM may bring the AP up
-before the HP2 scan has finished. Keep it manual (`net hotspot`) unless someone verifies that.
+Permanent fix (do once, then reboot): `sudo rig/install_hotspot_fallback.sh` writes
+`/etc/modprobe.d/rtl8852ce-hotspot.conf` (`options rtl8852ce rtw_ips_mode=0 rtw_lps_mode=0`) alongside the boot-time
+fallback unit; check with `cat /etc/modprobe.d/rtl8852ce-hotspot.conf`.
+After any hotspot/NM restart the PICO must rejoin the WiFi and reconnect the app. Do NOT make the `quest-hotspot`
+profile autoconnect (`connection.autoconnect yes` + a lower priority than HP2): an AP profile is available before the
+first scan returns, so NM would start the hotspot before it has seen HP2 and never switch. The `hotspot-fallback` unit
+(see **Network**) is the boot-time fallback instead.
 
 **No camera feed in Remote Vision**
 1. Close the panel fully and reopen → mjolnir's address for the current mode (the app single-accepts one
